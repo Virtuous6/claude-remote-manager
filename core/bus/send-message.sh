@@ -17,7 +17,7 @@ if [[ -z "${CRM_ROOT:-}" ]]; then
     CRM_ROOT="${HOME}/.claude-remote/${CRM_INSTANCE_ID}"
 fi
 
-CRM_AGENT_NAME="$(basename "$(pwd)")"
+CRM_AGENT_NAME="${CRM_AGENT_NAME:-$(basename "$(pwd)")}"
 FROM="${CRM_AGENT_NAME}"
 
 # Validate agent name to prevent injection

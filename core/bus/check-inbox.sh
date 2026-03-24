@@ -18,7 +18,7 @@ if [[ -z "${CRM_ROOT:-}" ]]; then
     CRM_INSTANCE_ID="${CRM_INSTANCE_ID:-default}"
     CRM_ROOT="${HOME}/.claude-remote/${CRM_INSTANCE_ID}"
 fi
-CRM_AGENT_NAME="$(basename "$(pwd)")"
+CRM_AGENT_NAME="${CRM_AGENT_NAME:-$(basename "$(pwd)")}"
 ME="${CRM_AGENT_NAME}"
 INBOX_DIR="${CRM_ROOT}/inbox/${ME}"
 INFLIGHT_DIR="${CRM_ROOT}/inflight/${ME}"

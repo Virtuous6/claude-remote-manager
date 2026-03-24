@@ -5,7 +5,7 @@
 set -euo pipefail
 
 TEMPLATE_ROOT="${CRM_TEMPLATE_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
-CRM_AGENT_NAME="$(basename "$(pwd)")"
+CRM_AGENT_NAME="${CRM_AGENT_NAME:-$(basename "$(pwd)")}"
 ME="${CRM_AGENT_NAME}"
 
 CHAT_ID="$1"

@@ -97,6 +97,29 @@ if [[ -n "${MODEL}" ]]; then
     MODEL_FLAG="--model ${MODEL}"
 fi
 
+# Working directory override: set "working_directory" in config.json to launch
+# Claude Code in a different project directory. The agent's identity (CLAUDE.md,
+# settings.json, .env) stays centralized here; only the cwd changes.
+WORK_DIR=$(jq -r '.working_directory // empty' "${AGENT_DIR}/config.json" 2>/dev/null || echo "")
+LAUNCH_DIR="${AGENT_DIR}"
+EXTRA_FLAGS=()
+
+if [[ -n "${WORK_DIR}" ]]; then
+    if [[ ! -d "${WORK_DIR}" ]]; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: working_directory '${WORK_DIR}' does not exist" >&2
+        exit 1
+    fi
+    LAUNCH_DIR="${WORK_DIR}"
+    # Inject agent identity into system prompt (since we're not in AGENT_DIR)
+    EXTRA_FLAGS+=(--append-system-prompt-file "${AGENT_DIR}/CLAUDE.md")
+    # Inject agent hooks/permissions from central repo
+    if [[ -f "${AGENT_DIR}/.claude/settings.json" ]]; then
+        EXTRA_FLAGS+=(--settings "${AGENT_DIR}/.claude/settings.json")
+    fi
+    # Give agent access to central repo for bus scripts, config, etc.
+    EXTRA_FLAGS+=(--add-dir "${TEMPLATE_ROOT}")
+fi
+
 # Prompts - two distinct variants based on start mode
 RESTART_NOTIFY="After setting up crons, send a Telegram message to the user saying you are back online, what session this is, and what you are about to work on."
 
@@ -110,12 +133,12 @@ CONTINUE_PROMPT="SESSION CONTINUATION: Your CLI process was restarted with --con
 # Without the marker, launchd respawns always use --continue to preserve conversation history.
 FORCE_FRESH_MARKER="${CRM_ROOT}/state/${AGENT}.force-fresh"
 
-cd "${AGENT_DIR}"
+cd "${LAUNCH_DIR}"
 
 # Determine start mode
 # Check if there's actually a conversation to continue by looking for .jsonl files
-# in Claude's project conversation directory.
-CONV_DIR="${HOME}/.claude/projects/-$(echo "${AGENT_DIR}" | tr '/' '-')"
+# in Claude's project conversation directory (based on the actual launch directory).
+CONV_DIR="${HOME}/.claude/projects/-$(echo "${LAUNCH_DIR}" | tr '/' '-')"
 HAS_CONVERSATION=false
 if [[ -d "${CONV_DIR}" ]] && ls "${CONV_DIR}"/*.jsonl &>/dev/null; then
     HAS_CONVERSATION=true
@@ -132,6 +155,15 @@ else
 fi
 
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) Starting ${AGENT} mode=${START_MODE} (session cap: ${MAX_SESSION}s)" >> "${LOG_DIR}/activity.log"
+
+# Register skills/commands as Telegram bot / autocomplete commands
+if [[ -n "${BOT_TOKEN:-}" ]]; then
+    REGISTER_SCRIPT="${TEMPLATE_ROOT}/core/scripts/register-telegram-commands.sh"
+    if [[ -f "${REGISTER_SCRIPT}" ]]; then
+        bash "${REGISTER_SCRIPT}" "${BOT_TOKEN}" "${LAUNCH_DIR}" "${AGENT_DIR}" \
+            >> "${LOG_DIR}/activity.log" 2>&1 || true
+    fi
+fi
 
 # Prevent Mac from sleeping while agent runs
 caffeinate -is -w $$ &
@@ -161,24 +193,32 @@ $(cat "${lf}")
     fi
 fi
 
+# Serialize EXTRA_FLAGS for use in generated scripts and tmux commands
+EXTRA_FLAGS_STR=""
+for flag in "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}"; do
+    EXTRA_FLAGS_STR+=" '${flag}'"
+done
+
 # Build the initial launch command based on start mode
 if [[ "${START_MODE}" == "fresh" ]]; then
     LAUNCHER="${LOG_DIR}/.launch.sh"
     cat > "${LAUNCHER}" << LAUNCH_SCRIPT
 #!/usr/bin/env bash
-cd '${AGENT_DIR}'
+cd '${LAUNCH_DIR}'
 ARGS=(--dangerously-skip-permissions)
 ${MODEL_FLAG:+ARGS+=(--model ${MODEL})}
 LOCAL_FILE="${LOG_DIR}/.local-prompt"
 if [[ -f "\${LOCAL_FILE}" ]]; then
     ARGS+=(--append-system-prompt "\$(cat "\${LOCAL_FILE}")")
 fi
+EXTRA=(${EXTRA_FLAGS_STR})
+ARGS+=("\${EXTRA[@]+"\${EXTRA[@]}"}")
 exec claude "\${ARGS[@]}" '${STARTUP_PROMPT}'
 LAUNCH_SCRIPT
     chmod +x "${LAUNCHER}"
     INITIAL_CMD="bash '${LAUNCHER}'"
 else
-    INITIAL_CMD="cd '${AGENT_DIR}' && claude --continue --dangerously-skip-permissions ${MODEL_FLAG} '${CONTINUE_PROMPT}'"
+    INITIAL_CMD="cd '${LAUNCH_DIR}' && claude --continue --dangerously-skip-permissions ${MODEL_FLAG}${EXTRA_FLAGS_STR} '${CONTINUE_PROMPT}'"
 fi
 
 # Start claude inside a tmux session
@@ -226,7 +266,7 @@ trap graceful_shutdown SIGTERM SIGINT
             fi
 
             tmux send-keys -t "${TMUX_SESSION}:0.0" \
-                "cd '${AGENT_DIR}' && claude --continue --dangerously-skip-permissions ${MODEL_FLAG} '${CONTINUE_PROMPT}'" Enter
+                "cd '${LAUNCH_DIR}' && claude --continue --dangerously-skip-permissions ${MODEL_FLAG}${EXTRA_FLAGS_STR} '${CONTINUE_PROMPT}'" Enter
 
             echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) Relaunched ${AGENT} with --continue" >> "${LOG_DIR}/activity.log"
         else

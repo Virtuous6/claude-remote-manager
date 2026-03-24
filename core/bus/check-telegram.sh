@@ -8,7 +8,7 @@ set -euo pipefail
 CRM_ROOT="${CRM_ROOT:-${HOME}/.claude-remote}"
 TEMPLATE_ROOT="${CRM_TEMPLATE_ROOT:-$(cd "$(dirname "$0")/../.." && pwd)}"
 # Always detect from cwd
-CRM_AGENT_NAME="$(basename "$(pwd)")"
+CRM_AGENT_NAME="${CRM_AGENT_NAME:-$(basename "$(pwd)")}"
 ME="${CRM_AGENT_NAME}"
 
 # Always source .env to get BOT_TOKEN
