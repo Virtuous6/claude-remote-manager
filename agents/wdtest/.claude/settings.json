@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": ["Bash", "Write", "Edit"]
+  },
+  "hooks": {
+    "Stop": [{
+      "type": "command", 
+      "command": "echo agent-stop-hook"
+    }]
+  }
+}

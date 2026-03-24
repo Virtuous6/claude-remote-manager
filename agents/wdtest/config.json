@@ -1,0 +1,9 @@
+{
+  "agent_name": "wdtest",
+  "enabled": true,
+  "startup_delay": 0,
+  "max_session_seconds": 3600,
+  "working_directory": "/tmp/test-working-dir-project",
+  "model": "claude-sonnet-4-6",
+  "crons": []
+}
