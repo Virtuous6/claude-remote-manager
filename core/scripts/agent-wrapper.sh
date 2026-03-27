@@ -354,7 +354,9 @@ if tail -20 "${LOG_DIR}/stderr.log" 2>/dev/null | grep -qi "rate.limit\|429\|cap
 fi
 
 # Check if this was a planned refresh or unexpected exit
-if tail -1 "${CRASH_LOG}" 2>/dev/null | grep -q "SESSION_REFRESH"; then
+# Use tail -5 instead of tail -1: the background timer writes SESSION_REFRESH
+# but other log entries can interleave before the main loop detects tmux is gone.
+if tail -5 "${CRASH_LOG}" 2>/dev/null | grep -q "SESSION_REFRESH"; then
     exit 0
 fi
 
