@@ -264,12 +264,18 @@ tmux send-keys -t "${TMUX_SESSION}:0.0" "${INITIAL_CMD}" Enter
 # Handle external SIGTERM (e.g., launchctl unload) gracefully
 graceful_shutdown() {
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) SIGTERM received for ${AGENT}" >> "${CRASH_LOG}"
+    # Kill background timer and fast-checker to prevent orphaned processes
+    kill "${TIMER_PID}" 2>/dev/null || true
+    if [[ -n "${FAST_PID:-}" ]]; then
+        kill "${FAST_PID}" 2>/dev/null || true
+    fi
     if tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
         tmux send-keys -t "${TMUX_SESSION}:0.0" \
             "SYSTEM SHUTDOWN: SIGTERM received. Session ending in 30 seconds. Save your work NOW." Enter
         sleep 30
         tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
     fi
+    exit 0
 }
 trap graceful_shutdown SIGTERM SIGINT
 
