@@ -77,7 +77,9 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
         FILE_PATH=$(echo "${FILE_RESPONSE}" | jq -r '.result.file_path // empty')
 
         if [[ -n "${FILE_PATH}" ]]; then
-            LOCAL_FILE="${IMAGE_DIR}/${DATE_VAL}.jpg"
+            # Use unique suffix from file_path to prevent overwrite in media groups
+            UNIQUE_SUFFIX=$(echo "${FILE_PATH}" | sed 's|.*/||;s|\..*||' | tail -c 12)
+            LOCAL_FILE="${IMAGE_DIR}/${DATE_VAL}_${UNIQUE_SUFFIX}.jpg"
             telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
 
             jq -nc \
