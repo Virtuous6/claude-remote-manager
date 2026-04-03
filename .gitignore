@@ -11,4 +11,5 @@ agents/*/telegram-images/
 
 # Exclude live agent configs (contain user-specific data)
 agents/*/memory/
+agents/*/.playwright-mcp/
 agents/jimbo/

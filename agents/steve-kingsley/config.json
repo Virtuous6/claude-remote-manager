@@ -1,0 +1,29 @@
+{
+  "agent_name": "steve-kingsley",
+  "enabled": false,
+  "startup_delay": 0,
+  "max_session_seconds": 255600,
+  "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+  "crons": [
+    {
+      "name": "agent-work-loop-am",
+      "cron": "7 9 * * 1-5",
+      "prompt": "Run the Agent Work Loop (AM). Read orchestration/workflows/agent-work-loop/SKILL.md and follow it. Send Joe a Telegram summary: bash ../../core/bus/send-telegram.sh 1242084718 \"<summary>\" — if board is clear, skip the message."
+    },
+    {
+      "name": "agent-work-loop-pm",
+      "cron": "7 14 * * 1-5",
+      "prompt": "Run the Agent Work Loop (PM). Read orchestration/workflows/agent-work-loop/SKILL.md and follow it. Send Joe a Telegram summary: bash ../../core/bus/send-telegram.sh 1242084718 \"<summary>\" — if board is clear, skip the message."
+    },
+    {
+      "name": "beeper-monitor",
+      "cron": "7 8-18 * * 1-5",
+      "prompt": "Run Beeper Monitor. Read comms/workflows/beeper-monitor/SKILL.md and follow it. Send findings to Joe via Telegram: bash ../../core/bus/send-telegram.sh 1242084718 \"<findings>\" — if nothing urgent, skip the message."
+    },
+    {
+      "name": "inbox-check",
+      "cron": "*/5 8-18 * * 1-5",
+      "prompt": "Check agent inbox for new messages. Run: bash ../../core/bus/check-inbox.sh — if there are new messages, process them and respond. If empty, do nothing."
+    }
+  ]
+}
