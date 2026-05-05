@@ -1,0 +1,8 @@
+{
+  "agent_name": "agent-template",
+  "enabled": false,
+  "startup_delay": 0,
+  "max_session_seconds": 255600,
+  "working_directory": "",
+  "crons": []
+}

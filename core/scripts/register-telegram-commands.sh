@@ -138,6 +138,7 @@ for dir in "${SCAN_DIRS[@]}"; do
     [[ -d "${dir}" ]] || continue
 
     while IFS= read -r file; do
+        [[ -n "${file}" ]] || continue
         IFS='|' read -r name desc invocable <<< "$(parse_frontmatter "${file}")"
 
         [[ -z "${name}" ]] && name=$(derive_name "${file}")

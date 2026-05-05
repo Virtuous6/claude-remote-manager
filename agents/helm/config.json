@@ -1,0 +1,11 @@
+{
+  "agent_name": "helm",
+  "enabled": true,
+  "startup_delay": 0,
+  "max_session_seconds": 255600,
+  "working_directory": "",
+  "crons": [],
+  "tier": "operator",
+  "parent": null,
+  "skill_pack": ["execution", "brand-voice", "workflow", "spawn-worker"]
+}

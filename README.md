@@ -120,6 +120,41 @@ tmux attach -t crm-default-<agent-name>
 tail -f ~/.claude-remote/default/logs/<agent-name>/activity.log
 ```
 
+## Restart Behavior
+
+Agents should run from a daemon-safe repo path, not from `~/Documents`, because
+launchd can hit macOS file privacy restrictions there. If you prefer editing from
+`~/Documents/repos`, keep that path as a symlink to the physical repo.
+
+Claude Code interactive positional prompts are not assumed to auto-submit. The
+wrapper starts Claude without a positional prompt, waits for the TUI to be ready,
+then injects the startup or continuation prompt through tmux. Generated launchers
+export `CRM_AGENT_NAME`, `CRM_ROOT`, `CRM_INSTANCE_ID`, and `CRM_TEMPLATE_ROOT` so
+bus commands resolve the correct agent config even when the agent works inside a
+different project directory.
+
+If Claude Code leaves an injected Telegram or scheduled prompt as an idle draft,
+`fast-checker` presses Enter once with a cooldown. This handles TUI versions that
+accept pasted text but occasionally miss the submit keystroke. Draft recovery is
+rate-limited so a repeated visible draft cannot turn into an input loop.
+
+Soft restarts do not depend on Claude Code's `/exit` flow. The restart runner
+starts in its own detached tmux session, respawns the agent pane, starts a clean
+shell, and then relaunches Claude with `--continue`. This avoids optional exit
+surveys or other TUI prompts blocking a restart.
+
+Fresh starts and self-restarts both merge the target project's
+`.claude/settings.json` with the agent's `.claude/settings.json`; project settings
+are the base and agent settings override or extend them. This keeps hooks and
+permissions consistent across launchd starts and `self-restart.sh`.
+
+## Tests
+
+```bash
+bash -n core/bus/*.sh core/scripts/*.sh scripts/*.sh
+bash tests/restart-flow.test.sh
+```
+
 ## Onboarding Skill
 
 If you're already in a Claude Code session inside this repo, run:

@@ -1,0 +1,11 @@
+{
+  "agent_name": "worker-template",
+  "enabled": false,
+  "startup_delay": 0,
+  "max_session_seconds": 86400,
+  "working_directory": "",
+  "crons": [],
+  "tier": "worker",
+  "parent": "helm",
+  "skill_pack": []
+}

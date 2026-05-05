@@ -1,0 +1,15 @@
+{
+  "agent_name": "scribe",
+  "enabled": false,
+  "startup_delay": 0,
+  "max_session_seconds": 86400,
+  "working_directory": "",
+  "crons": [],
+  "tier": "worker",
+  "parent": "helm",
+  "skill_pack": [
+    "writing",
+    "content",
+    "brand-voice"
+  ]
+}

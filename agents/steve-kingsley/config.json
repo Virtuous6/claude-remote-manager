@@ -1,0 +1,85 @@
+{
+  "agent_name": "steve-kingsley",
+  "enabled": false,
+  "startup_delay": 0,
+  "max_session_seconds": 255600,
+  "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+  "crons": [
+    {
+      "name": "agent-work-loop-am",
+      "cron": "7 9 * * 1-5",
+      "prompt": "Run the Agent Work Loop (AM). Read orchestration/workflows/agent-work-loop/SKILL.md and follow it. Send Joe a Telegram summary: bash \"$CRM_TEMPLATE_ROOT/core/bus/send-telegram.sh\" 1242084718 \"<summary>\" — if board is clear, skip the message."
+    },
+    {
+      "name": "agent-work-loop-pm",
+      "cron": "7 14 * * 1-5",
+      "prompt": "Run the Agent Work Loop (PM). Read orchestration/workflows/agent-work-loop/SKILL.md and follow it. Send Joe a Telegram summary: bash \"$CRM_TEMPLATE_ROOT/core/bus/send-telegram.sh\" 1242084718 \"<summary>\" — if board is clear, skip the message."
+    },
+    {
+      "name": "beeper-monitor",
+      "cron": "7 8-18 * * 1-5",
+      "prompt": "Run Beeper Monitor. Read comms/workflows/beeper-monitor/SKILL.md and follow it. Send findings to Joe via Telegram: bash \"$CRM_TEMPLATE_ROOT/core/bus/send-telegram.sh\" 1242084718 \"<findings>\" — if nothing urgent, skip the message."
+    },
+    {
+      "name": "inbox-check",
+      "cron": "*/5 8-18 * * 1-5",
+      "prompt": "Check agent inbox for new messages. Run: bash \"$CRM_TEMPLATE_ROOT/core/bus/check-inbox.sh\" — if there are new messages, process them and respond. If empty, do nothing."
+    },
+    {
+      "name": "rp-gather",
+      "enabled": false,
+      "cron": "50 7 * * *",
+      "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+      "prompt": "Use today's local date in America/Chicago. Gather Relationship Pulse inputs from calendar, Gmail, messages, and sessions. Write raw JSON snapshots under /tmp/power-assistant-joe/relationship-pulse/<today>/ and run ./scripts/pa-runtime relationship-pulse collect with today's date plus matching --calendar-input, --email-input, --messages-input, and --sessions-input files. Continue if a source is unavailable and report missing sources plus canonical ingest files written."
+    },
+    {
+      "name": "rp-compile",
+      "enabled": false,
+      "cron": "52 7 * * *",
+      "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+      "prompt": "Use today's local date in America/Chicago. Run ./scripts/pa-runtime relationship-pulse build --date <today> --sync-contacts from the repo root. Then read the generated JSON under _CC/orchestration/state/relationship-pulse and report trust level, source_status, summary counts, contact updates count, and output path. Do not write editorial prose."
+    },
+    {
+      "name": "ww-gather",
+      "enabled": false,
+      "cron": "55 7 * * *",
+      "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+      "prompt": "Use today's local date in America/Chicago. Gather explicit waiting-thread inputs from email and messages. Write raw JSON snapshots under /tmp/power-assistant-joe/whos-waiting/<today>/ and run ./scripts/pa-runtime whos-waiting collect with today's date plus matching --email-input and --messages-input files. Continue if a source is unavailable and report missing sources plus canonical ingest files written."
+    },
+    {
+      "name": "ww-compile",
+      "enabled": false,
+      "cron": "56 7 * * *",
+      "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+      "prompt": "Use today's local date in America/Chicago. Run ./scripts/pa-runtime whos-waiting build --date <today> from the repo root. Then read the generated JSON under _CC/orchestration/state/whos-waiting and report trust level, source_status, totals, tier counts, and output path. Do not write editorial prose."
+    },
+    {
+      "name": "mb-gather",
+      "enabled": false,
+      "cron": "58 7 * * *",
+      "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+      "prompt": "Use today's local date in America/Chicago. Gather Morning Brief inputs from calendar, Gmail, and messages. Write raw JSON snapshots under /tmp/power-assistant-joe/morning-brief/<today>/ and run ./scripts/pa-runtime morning-brief collect with today's date plus matching --calendar-input, --email-input, and --messages-input files. Continue if a source is unavailable and report missing sources plus canonical ingest files written."
+    },
+    {
+      "name": "mb-compile",
+      "enabled": false,
+      "cron": "0 8 * * *",
+      "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+      "prompt": "Use today's local date in America/Chicago. Run ./scripts/pa-runtime morning-brief build --date <today> from the repo root. Then read the generated JSON under _CC/orchestration/state/morning-brief and report trust level, source_status, summary counts, and output path. Do not write editorial prose."
+    },
+    {
+      "name": "rp-write",
+      "enabled": false,
+      "cron": "3 8 * * *",
+      "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+      "prompt": "Use today's local date in America/Chicago.\n\nFirst read:\n- /Users/josephsanchez/Documents/repos/power-assistant-joe/CLAUDE.md\n- /Users/josephsanchez/Documents/repos/power-assistant-joe/briefs/workflows/relationship-pulse/SKILL.md\n\nThen read the compiled facts JSON:\n- /Users/josephsanchez/Documents/OBSIDIAN/Lucky Obsidian/_CC/orchestration/state/relationship-pulse/<today>.json\n\nRules:\n- Do not gather data\n- Do not run collect\n- Do not re-check connectors\n- Do not invent machine truth\n- Use the compiled JSON as source of truth for counts, waiting lists, active contacts, upcoming meetings, new contacts, and contact updates\n- Narrative may interpret facts, not replace them\n\nTrust handling:\n- If source_status.provenance = ingest, write normally\n- If source_status.provenance = mixed, add a short note near the top that this is a partial/degraded run\n- If source_status.provenance = bootstrap, add a short note near the top that this is fallback-derived\n\nWrite the final user-facing Relationship Pulse markdown to:\n- /Users/josephsanchez/Documents/OBSIDIAN/Lucky Obsidian/_CC/Briefs/Relationships/YYYY/MM/YYMMDD_relationship-pulse.md\n\nReport:\n- provenance\n- output path\n- whether degraded note was added"
+    },
+    {
+      "name": "mb-write",
+      "enabled": false,
+      "cron": "5 8 * * *",
+      "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
+      "prompt": "Use today's local date in America/Chicago.\n\nFirst read:\n- /Users/josephsanchez/Documents/repos/power-assistant-joe/CLAUDE.md\n- /Users/josephsanchez/Documents/repos/power-assistant-joe/briefs/workflows/morning-brief/SKILL.md\n\nThen read these compiled state files:\n- /Users/josephsanchez/Documents/OBSIDIAN/Lucky Obsidian/_CC/orchestration/state/morning-brief/<today>.json\n- /Users/josephsanchez/Documents/OBSIDIAN/Lucky Obsidian/_CC/orchestration/state/whos-waiting/current.json\n\nRules:\n- Do not gather data\n- Do not run collect\n- Do not re-check connectors\n- Do not invent machine truth\n- Use the compiled JSON as source of truth for summary counts, inbox, messages, schedule, due_today, upcoming, delegated, waiting_on, and who's-waiting context\n- Narrative may interpret facts, not replace them\n\nTrust handling:\n- If morning-brief source_status.provenance = ingest, write normally\n- If provenance = mixed, add a short partial/degraded note near the top\n- If provenance = bootstrap, add a short fallback note near the top\n- If who's-waiting provenance is mixed/bootstrap, reflect that in the brief language when referencing waiting items\n\nWrite the final user-facing Daily Brief markdown to:\n- /Users/josephsanchez/Documents/OBSIDIAN/Lucky Obsidian/_CC/Briefs/Daily/YYYY/MM/YYMMDD_daily-brief.md\n\nReport:\n- provenance\n- who's-waiting provenance\n- output path\n- whether degraded note was added"
+    }
+  ]
+}

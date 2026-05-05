@@ -91,11 +91,7 @@ sleep ${DELAY}
 MAX_SESSION=$(jq -r '.max_session_seconds // 255600' "${AGENT_DIR}/config.json" 2>/dev/null || echo "255600")
 
 # Model override: set "model" in config.json (e.g. "claude-haiku-4-5-20251001")
-MODEL_FLAG=""
 MODEL=$(jq -r '.model // empty' "${AGENT_DIR}/config.json" 2>/dev/null || echo "")
-if [[ -n "${MODEL}" ]]; then
-    MODEL_FLAG="--model ${MODEL}"
-fi
 
 # Working directory override: set "working_directory" in config.json to launch
 # Claude Code in a different project directory. The agent's identity (CLAUDE.md,
@@ -156,12 +152,20 @@ fi
 
 # Prompts - two distinct variants based on start mode
 RESTART_NOTIFY="After setting up crons, send a Telegram message to the user saying you are back online, what session this is, and what you are about to work on."
+CRON_SETUP_INSTRUCTION="Create one separate cron/loop for each enabled entry in the crons array. Do not combine entries into one dispatcher."
+
+# Check for handoff file from previous session (Fix 5: Graceful Context Handoff)
+HANDOFF_FILE="${CRM_ROOT}/state/${AGENT}.handoff.md"
+HANDOFF_INSTRUCTION=""
+if [[ -f "${HANDOFF_FILE}" ]]; then
+    HANDOFF_INSTRUCTION=" IMPORTANT: Read ${HANDOFF_FILE} for context from your previous session, then delete it after reading."
+fi
 
 # STARTUP_PROMPT: used for fresh starts (hard-restart or first-ever launch)
-STARTUP_PROMPT="You are starting a new session. Read all bootstrap files listed in CLAUDE.md. Then read config.json and set up your crons using /loop for each entry in the crons array. ${RESTART_NOTIFY}"
+STARTUP_PROMPT="You are starting a new session. Read all bootstrap files listed in CLAUDE.md. Then read config.json and set up your crons using /loop for each entry in the crons array. ${CRON_SETUP_INSTRUCTION}${HANDOFF_INSTRUCTION} ${RESTART_NOTIFY}"
 
 # CONTINUE_PROMPT: used when resuming via --continue (timer refresh or self-restart)
-CONTINUE_PROMPT="SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Your full conversation history is preserved. Do the following immediately: 1) Re-read ALL bootstrap files listed in CLAUDE.md. 2) Set up your crons from config.json using /loop (they were lost when the CLI restarted). 3) Check inbox. 4) Resume normal operations. ${RESTART_NOTIFY}"
+CONTINUE_PROMPT="SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Your full conversation history is preserved. Do the following immediately: 1) Re-read ALL bootstrap files listed in CLAUDE.md. 2) Set up your crons from config.json using /loop (they were lost when the CLI restarted). ${CRON_SETUP_INSTRUCTION} 3) Check inbox. 4) Resume normal operations. ${RESTART_NOTIFY}"
 
 # Force-fresh marker: written by hard-restart.sh to signal a clean slate is needed.
 # Without the marker, launchd respawns always use --continue to preserve conversation history.
@@ -227,32 +231,70 @@ $(cat "${lf}")
     fi
 fi
 
-# Serialize EXTRA_FLAGS for use in generated scripts and tmux commands
-EXTRA_FLAGS_STR=""
-for flag in "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}"; do
-    EXTRA_FLAGS_STR+=" '${flag}'"
-done
+write_claude_launcher() {
+    local launcher="$1"
+    local mode="$2"
 
-# Build the initial launch command based on start mode
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'cd %q\n' "${LAUNCH_DIR}"
+        printf 'export CRM_AGENT_NAME=%q\n' "${AGENT}"
+        printf 'export CRM_INSTANCE_ID=%q\n' "${CRM_INSTANCE_ID}"
+        printf 'export CRM_ROOT=%q\n' "${CRM_ROOT}"
+        printf 'export CRM_TEMPLATE_ROOT=%q\n' "${TEMPLATE_ROOT}"
+        if [[ "${mode}" == "continue" ]]; then
+            printf 'ARGS=(--continue --dangerously-skip-permissions)\n'
+        else
+            printf 'ARGS=(--dangerously-skip-permissions)\n'
+        fi
+        if [[ -n "${MODEL}" ]]; then
+            printf 'ARGS+=(--model %q)\n' "${MODEL}"
+        fi
+        printf 'LOCAL_FILE=%q\n' "${LOG_DIR}/.local-prompt"
+        printf 'if [[ -f "${LOCAL_FILE}" ]]; then\n'
+        printf '    ARGS+=(--append-system-prompt "$(cat "${LOCAL_FILE}")")\n'
+        printf 'fi\n'
+        printf 'EXTRA=('
+        for flag in "${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"}"; do
+            printf ' %q' "${flag}"
+        done
+        printf ' )\n'
+        printf 'ARGS+=("${EXTRA[@]+"${EXTRA[@]}"}")\n'
+        printf 'exec claude "${ARGS[@]}"\n'
+    } > "${launcher}"
+    chmod +x "${launcher}"
+}
+
+alert_prompt_injection_failure() {
+    local phase="$1"
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR ${phase} prompt injection failed for ${AGENT}" >> "${CRASH_LOG}"
+    if [[ -n "${BOT_TOKEN:-}" && -n "${CHAT_ID:-}" ]]; then
+        curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="${CHAT_ID}" \
+            -d text="ALERT: ${AGENT} restart prompt injection failed (${phase}). Attach: tmux attach -t ${TMUX_SESSION}" \
+            > /dev/null 2>&1 || true
+    fi
+}
+
+INJECT_PROMPT_SCRIPT="${TEMPLATE_ROOT}/core/bus/inject-prompt.sh"
+STARTUP_PROMPT_FILE="${LOG_DIR}/.startup-prompt"
+CONTINUE_PROMPT_FILE="${LOG_DIR}/.continue-prompt"
+FRESH_LAUNCHER="${LOG_DIR}/.launch.sh"
+CONTINUE_LAUNCHER="${LOG_DIR}/.continue.sh"
+
+write_claude_launcher "${FRESH_LAUNCHER}" fresh
+write_claude_launcher "${CONTINUE_LAUNCHER}" continue
+
+# Build the initial launch command based on start mode. The prompt is injected
+# after Claude's TUI is ready; positional prompts no longer reliably auto-submit.
 if [[ "${START_MODE}" == "fresh" ]]; then
-    LAUNCHER="${LOG_DIR}/.launch.sh"
-    cat > "${LAUNCHER}" << LAUNCH_SCRIPT
-#!/usr/bin/env bash
-cd '${LAUNCH_DIR}'
-ARGS=(--dangerously-skip-permissions)
-${MODEL_FLAG:+ARGS+=(--model ${MODEL})}
-LOCAL_FILE="${LOG_DIR}/.local-prompt"
-if [[ -f "\${LOCAL_FILE}" ]]; then
-    ARGS+=(--append-system-prompt "\$(cat "\${LOCAL_FILE}")")
-fi
-EXTRA=(${EXTRA_FLAGS_STR})
-ARGS+=("\${EXTRA[@]+"\${EXTRA[@]}"}")
-exec claude "\${ARGS[@]}" '${STARTUP_PROMPT}'
-LAUNCH_SCRIPT
-    chmod +x "${LAUNCHER}"
-    INITIAL_CMD="bash '${LAUNCHER}'"
+    printf '%s' "${STARTUP_PROMPT}" > "${STARTUP_PROMPT_FILE}"
+    BOOTSTRAP_PROMPT_FILE="${STARTUP_PROMPT_FILE}"
+    INITIAL_CMD="bash $(printf '%q' "${FRESH_LAUNCHER}")"
 else
-    INITIAL_CMD="cd '${LAUNCH_DIR}' && claude --continue --dangerously-skip-permissions ${MODEL_FLAG}${EXTRA_FLAGS_STR} '${CONTINUE_PROMPT}'"
+    printf '%s' "${CONTINUE_PROMPT}" > "${CONTINUE_PROMPT_FILE}"
+    BOOTSTRAP_PROMPT_FILE="${CONTINUE_PROMPT_FILE}"
+    INITIAL_CMD="bash $(printf '%q' "${CONTINUE_LAUNCHER}")"
 fi
 
 # Start claude inside a tmux session
@@ -260,6 +302,12 @@ fi
 # where /loop crons can fire. Without a PTY, claude exits immediately.
 tmux new-session -d -s "${TMUX_SESSION}" bash
 tmux send-keys -t "${TMUX_SESSION}:0.0" "${INITIAL_CMD}" Enter
+
+if [[ -f "${INJECT_PROMPT_SCRIPT}" ]]; then
+    if ! bash "${INJECT_PROMPT_SCRIPT}" "${TMUX_SESSION}" "${BOOTSTRAP_PROMPT_FILE}" "${LOG_DIR}/activity.log" "${START_MODE}-bootstrap" 60; then
+        alert_prompt_injection_failure "${START_MODE}-bootstrap"
+    fi
+fi
 
 # Handle external SIGTERM (e.g., launchctl unload) gracefully
 graceful_shutdown() {
@@ -286,27 +334,33 @@ trap graceful_shutdown SIGTERM SIGINT
         echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) SESSION_REFRESH after ${MAX_SESSION}s agent=${AGENT}" >> "${CRASH_LOG}"
 
         if tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
-            tmux send-keys -t "${TMUX_SESSION}:0.0" C-c
-            sleep 1
-            tmux send-keys -t "${TMUX_SESSION}:0.0" "/exit" Enter
-            sleep 3
-
-            CLAUDE_PID=$(tmux list-panes -t "${TMUX_SESSION}" -F '#{pane_pid}' 2>/dev/null | head -1)
-            if [[ -n "$CLAUDE_PID" ]]; then
-                pkill -P "$CLAUDE_PID" 2>/dev/null || true
-                sleep 2
+            PANE_ID=$(tmux list-panes -t "${TMUX_SESSION}" -F '#{pane_id}' 2>/dev/null | head -1)
+            if [[ -n "${PANE_ID}" ]]; then
+                tmux send-keys -t "${PANE_ID}" C-c || true
+                sleep 1
+                tmux respawn-pane -k -t "${PANE_ID}" bash
+                sleep 1
             fi
 
-            # Kill old fast-checker and start fresh one
+            # Kill old fast-checker. Start a fresh one after bootstrap prompt lands.
+            rm -f "${CRM_ROOT}/state/${AGENT}.fast-checker.pid"
+            rm -rf "${CRM_ROOT}/state/${AGENT}.fast-checker.lock"
             pkill -f "fast-checker.sh ${AGENT} " 2>/dev/null || true
             sleep 1
+
+            printf '%s' "${CONTINUE_PROMPT}" > "${CONTINUE_PROMPT_FILE}"
+            tmux send-keys -t "${PANE_ID:-${TMUX_SESSION}:0.0}" "bash $(printf '%q' "${CONTINUE_LAUNCHER}")" Enter
+
+            if [[ -f "${INJECT_PROMPT_SCRIPT}" ]]; then
+                bash "${INJECT_PROMPT_SCRIPT}" "${TMUX_SESSION}" "${CONTINUE_PROMPT_FILE}" "${LOG_DIR}/activity.log" "timer-continue" 60 || \
+                    alert_prompt_injection_failure "timer-continue"
+            fi
+
             if [[ -f "${TEMPLATE_ROOT}/core/scripts/fast-checker.sh" ]]; then
                 bash "${TEMPLATE_ROOT}/core/scripts/fast-checker.sh" "${AGENT}" "${TMUX_SESSION}" "${AGENT_DIR}" "${TEMPLATE_ROOT}" \
                     >> "${LOG_DIR}/fast-checker.log" 2>&1 &
+                FAST_PID=$!
             fi
-
-            tmux send-keys -t "${TMUX_SESSION}:0.0" \
-                "cd '${LAUNCH_DIR}' && claude --continue --dangerously-skip-permissions ${MODEL_FLAG}${EXTRA_FLAGS_STR} '${CONTINUE_PROMPT}'" Enter
 
             echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) Relaunched ${AGENT} with --continue" >> "${LOG_DIR}/activity.log"
         else
@@ -317,6 +371,8 @@ trap graceful_shutdown SIGTERM SIGINT
 TIMER_PID=$!
 
 # Kill any stale fast-checker for this agent before starting a fresh one.
+rm -f "${CRM_ROOT}/state/${AGENT}.fast-checker.pid"
+rm -rf "${CRM_ROOT}/state/${AGENT}.fast-checker.lock"
 pkill -f "fast-checker.sh ${AGENT} " 2>/dev/null || true
 
 # Start fast message checker (Telegram + inbox polling every 3s)
@@ -330,9 +386,22 @@ fi
 
 # Wait for the tmux session to end
 while tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; do
-    # Watchdog: restart fast-checker if it died unexpectedly
-    if [[ -n "${FAST_PID:-}" ]] && ! kill -0 "${FAST_PID}" 2>/dev/null; then
-        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) fast-checker died (pid ${FAST_PID}), restarting" >> "${LOG_DIR}/fast-checker.log"
+    # Watchdog: restart fast-checker if no healthy instance is running.
+    FC_PIDFILE="${CRM_ROOT}/state/${AGENT}.fast-checker.pid"
+    FC_ALIVE=false
+    if [[ -f "$FC_PIDFILE" ]]; then
+        FC_PID_FROM_FILE=$(cat "$FC_PIDFILE" 2>/dev/null || echo "")
+        if [[ -n "$FC_PID_FROM_FILE" ]] && kill -0 "$FC_PID_FROM_FILE" 2>/dev/null; then
+            FC_ALIVE=true
+        fi
+    fi
+    if [[ "$FC_ALIVE" == "false" && -n "${FAST_PID:-}" ]] && kill -0 "${FAST_PID}" 2>/dev/null; then
+        FC_ALIVE=true
+    fi
+    if [[ "$FC_ALIVE" == "false" ]]; then
+        echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) fast-checker died, restarting" >> "${LOG_DIR}/fast-checker.log"
+        rm -f "$FC_PIDFILE"
+        rm -rf "${CRM_ROOT}/state/${AGENT}.fast-checker.lock"
         bash "${FAST_CHECKER}" "${AGENT}" "${TMUX_SESSION}" "${AGENT_DIR}" "${TEMPLATE_ROOT}" \
             >> "${LOG_DIR}/fast-checker.log" 2>&1 &
         FAST_PID=$!
@@ -346,6 +415,13 @@ EXIT_CODE=0
 kill ${TIMER_PID} 2>/dev/null || true
 
 # Kill fast checker alongside session
+FC_PIDFILE="${CRM_ROOT}/state/${AGENT}.fast-checker.pid"
+if [[ -f "$FC_PIDFILE" ]]; then
+    FC_KILL_PID=$(cat "$FC_PIDFILE" 2>/dev/null || echo "")
+    [[ -n "$FC_KILL_PID" ]] && kill "$FC_KILL_PID" 2>/dev/null || true
+    rm -f "$FC_PIDFILE"
+    rm -rf "${CRM_ROOT}/state/${AGENT}.fast-checker.lock"
+fi
 if [[ -n "${FAST_PID:-}" ]]; then
     kill "${FAST_PID}" 2>/dev/null || true
 fi
