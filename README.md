@@ -133,11 +133,6 @@ export `CRM_AGENT_NAME`, `CRM_ROOT`, `CRM_INSTANCE_ID`, and `CRM_TEMPLATE_ROOT` 
 bus commands resolve the correct agent config even when the agent works inside a
 different project directory.
 
-If Claude Code leaves an injected Telegram or scheduled prompt as an idle draft,
-`fast-checker` presses Enter once with a cooldown. This handles TUI versions that
-accept pasted text but occasionally miss the submit keystroke. Draft recovery is
-rate-limited so a repeated visible draft cannot turn into an input loop.
-
 Soft restarts do not depend on Claude Code's `/exit` flow. The restart runner
 starts in its own detached tmux session, respawns the agent pane, starts a clean
 shell, and then relaunches Claude with `--continue`. This avoids optional exit

@@ -102,14 +102,6 @@ PANE_STALE_SINCE=0              # when pane content stopped changing
 PANE_UNCHANGED_SINCE=0         # for passive frozen detection
 PASSIVE_FROZEN_THRESHOLD=600   # 10 min of zero pane change while busy = frozen
 PASSIVE_FROZEN_TRIGGERED=false
-LAST_AUTOSUBMIT_DRAFT=""
-LAST_AUTOSUBMIT_TS=0
-AUTOSUBMIT_WINDOW_START=0
-AUTOSUBMIT_WINDOW_COUNT=0
-AUTOSUBMIT_WINDOW_SECONDS=300
-AUTOSUBMIT_WINDOW_LIMIT=6
-AUTOSUBMIT_RATE_LIMIT_LOGGED=false
-
 # Live activity streaming state
 ACTIVITY_STREAMING=$(jq -r '.activity_streaming // false' "${AGENT_DIR}/config.json" 2>/dev/null || echo "false")
 ACTIVITY_INTERVAL=$(jq -r '.activity_interval_seconds // 8' "${AGENT_DIR}/config.json" 2>/dev/null || echo "8")
@@ -153,59 +145,6 @@ is_agent_idle() {
 
     echo "$pane_bottom" | grep -q "${chevron}" && return 0
     echo "$pane_bottom" | grep -qE '^[[:space:]]*>[[:space:]]*$'
-}
-
-autosubmit_idle_prompt_draft() {
-    is_agent_idle || return 1
-
-    local pane_bottom chevron nbsp line draft normalized now
-    pane_bottom=$(tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>/dev/null | tail -8)
-    chevron=$(printf '\342\235\257')
-    nbsp=$(printf '\302\240')
-    line=$(printf '%s\n' "$pane_bottom" | grep "${chevron}" | tail -1 || true)
-    [[ -n "$line" ]] || return 1
-
-    draft="${line#*${chevron}}"
-    draft=$(printf '%s' "$draft" | tr -d "$nbsp" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-    [[ -n "$draft" ]] || return 1
-
-    normalized=$(printf '%s' "$draft" | tr '[:upper:]' '[:lower:]')
-    case "$normalized" in
-        try\ *|press\ up\ to\ edit\ queued\ messages*|how\ is\ claude\ doing\ this\ session*|check\ inbox|check\ beeper)
-            return 1
-            ;;
-    esac
-
-    now=$(date +%s)
-    if (( AUTOSUBMIT_WINDOW_START == 0 || now - AUTOSUBMIT_WINDOW_START >= AUTOSUBMIT_WINDOW_SECONDS )); then
-        AUTOSUBMIT_WINDOW_START=$now
-        AUTOSUBMIT_WINDOW_COUNT=0
-        AUTOSUBMIT_RATE_LIMIT_LOGGED=false
-    elif (( AUTOSUBMIT_WINDOW_COUNT >= AUTOSUBMIT_WINDOW_LIMIT )); then
-        if [[ "$AUTOSUBMIT_RATE_LIMIT_LOGGED" != "true" ]]; then
-            log "Auto-submit paused after ${AUTOSUBMIT_WINDOW_COUNT} idle drafts in ${AUTOSUBMIT_WINDOW_SECONDS}s"
-            AUTOSUBMIT_RATE_LIMIT_LOGGED=true
-        fi
-        return 1
-    fi
-
-    if [[ "$normalized" == "$LAST_AUTOSUBMIT_DRAFT" ]] && (( now - LAST_AUTOSUBMIT_TS < 30 )); then
-        return 1
-    fi
-    LAST_AUTOSUBMIT_DRAFT="$normalized"
-    LAST_AUTOSUBMIT_TS="$now"
-    AUTOSUBMIT_WINDOW_COUNT=$((AUTOSUBMIT_WINDOW_COUNT + 1))
-    tmux send-keys -t "${TMUX_SESSION}:0.0" Enter
-    case "$normalized" in
-        "check the inbox"|"run beeper monitor"|"run the agent work loop"|"run the agent work loop (am)"|"run the agent work loop (pm)")
-            log "Auto-submitted idle scheduled draft: ${draft}"
-            ;;
-        *)
-            log "Auto-submitted idle draft: ${draft:0:120}"
-            ;;
-    esac
-
-    return 0
 }
 
 # Auto-reply on Telegram when agent is busy processing
@@ -472,15 +411,10 @@ while true; do
         continue
     fi
 
-    if autosubmit_idle_prompt_draft; then
-        sleep 5
-        continue
-    fi
-
     # --- Telegram ---
-    # Capture offset from fd3 so we can commit it AFTER successful injection.
+    # Capture offset in a temp file so we can commit it AFTER successful injection.
     TG_OFFSET_FILE=$(mktemp /tmp/crm-tg-offset-XXXXXX 2>/dev/null || echo "/tmp/crm-tg-offset-$$")
-    TG_OUTPUT=$(bash "${BUS_DIR}/check-telegram.sh" 3>"$TG_OFFSET_FILE" 2>/dev/null || echo "")
+    TG_OUTPUT=$(CRM_DEFER_TELEGRAM_OFFSET_FILE="$TG_OFFSET_FILE" bash "${BUS_DIR}/check-telegram.sh" 2>/dev/null || echo "")
     TG_NEW_OFFSET=""
     if [[ -f "$TG_OFFSET_FILE" ]]; then
         TG_NEW_OFFSET=$(grep '__OFFSET__:' "$TG_OFFSET_FILE" 2>/dev/null | sed 's/__OFFSET__://' || true)

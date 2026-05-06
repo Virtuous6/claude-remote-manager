@@ -108,9 +108,13 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
     }'
 fi
 
-# Update offset AFTER all messages have been output
-# This prevents silent message loss if the script crashes mid-output
-NEW_OFFSET=$(echo "${RESPONSE}" | jq '.result[-1].update_id + 1 // empty')
+# Report offset only when Telegram returned at least one update. When a defer
+# file is provided, fast-checker commits this after successful tmux injection.
+NEW_OFFSET=$(echo "${RESPONSE}" | jq -r 'if (.result | length) > 0 then (.result[-1].update_id + 1 | tostring) else empty end')
 if [[ -n "${NEW_OFFSET}" ]]; then
-    echo "${NEW_OFFSET}" > "${OFFSET_FILE}"
+    if [[ -n "${CRM_DEFER_TELEGRAM_OFFSET_FILE:-}" ]]; then
+        printf '__OFFSET__:%s\n' "${NEW_OFFSET}" > "${CRM_DEFER_TELEGRAM_OFFSET_FILE}" || printf '%s\n' "${NEW_OFFSET}" > "${OFFSET_FILE}"
+    else
+        printf '%s\n' "${NEW_OFFSET}" > "${OFFSET_FILE}"
+    fi
 fi
