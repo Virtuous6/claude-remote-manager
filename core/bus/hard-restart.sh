@@ -7,8 +7,9 @@
 
 set -euo pipefail
 
-AGENT="$(basename "$(pwd)")"
-TEMPLATE_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TEMPLATE_ROOT="${CRM_TEMPLATE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+AGENT="${CRM_AGENT_NAME:-$(basename "$(pwd)")}"
 
 # Load instance ID
 REPO_ENV="${TEMPLATE_ROOT}/.env"
@@ -38,9 +39,12 @@ rm -f "${LOG_DIR}/.crash_count_today"
 mkdir -p "${CRM_ROOT}/state"
 touch "${CRM_ROOT}/state/${AGENT}.force-fresh"
 
-# Detach a subprocess to perform the restart after a short delay
-nohup bash -c "sleep 10 && launchctl unload '${PLIST}' 2>/dev/null; sleep 1 && launchctl load '${PLIST}'" \
+# Detach so the current Claude/tool call can exit before launchd kills it.
+USER_ID=$(id -u)
+LABEL="com.claude-remote.${CRM_INSTANCE_ID}.${AGENT}"
+RESTART_CMD="sleep 5; if launchctl print 'gui/${USER_ID}/${LABEL}' >/dev/null 2>&1; then launchctl kickstart -k 'gui/${USER_ID}/${LABEL}'; else launchctl unload '${PLIST}' 2>/dev/null; sleep 1; launchctl load '${PLIST}'; fi"
+nohup bash -c "${RESTART_CMD}" \
     >> "${LOG_DIR}/restarts.log" 2>&1 &
 disown
 
-echo "Hard-restart scheduled for ${AGENT} in ~10 seconds. New session will start fresh."
+echo "Hard-restart scheduled for ${AGENT} in ~5 seconds. New session will start fresh."

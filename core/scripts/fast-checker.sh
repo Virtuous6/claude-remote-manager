@@ -30,6 +30,19 @@ log() {
     echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) [fast-checker/${AGENT}] $1" >> "$LOG_FILE"
 }
 
+read_int_config() {
+    local key="$1"
+    local default="$2"
+    local file="${3:-${AGENT_DIR}/config.json}"
+    local result
+    result=$(jq -r "(${key} // ${default}) | (tonumber? // ${default}) | if . > 2147483647 then 2147483647 elif . < -2147483648 then -2147483648 else floor end" \
+        "${file}" 2>/dev/null) || result="${default}"
+    if [[ ! "${result}" =~ ^-?[0-9]+$ ]]; then
+        result="${default}"
+    fi
+    printf '%s' "${result}"
+}
+
 # --- Singleton: prevent duplicate fast-checker processes per agent ---
 # Use mkdir as an atomic lock (POSIX-portable, works on macOS without flock).
 # The lock dir exists for the lifetime of this process. If another instance
@@ -81,8 +94,8 @@ fi
 SESSION_START=$(cat "${SESSION_START_FILE}")
 
 # Configurable thresholds (from config.json or defaults)
-CONTEXT_MAX_HOURS=$(jq -r '.context_max_hours // 16' "${AGENT_DIR}/config.json" 2>/dev/null || echo "16")
-CONTEXT_MAX_INJECTIONS=$(jq -r '.context_max_injections // 150' "${AGENT_DIR}/config.json" 2>/dev/null || echo "150")
+CONTEXT_MAX_HOURS=$(read_int_config '.context_max_hours' 16)
+CONTEXT_MAX_INJECTIONS=$(read_int_config '.context_max_injections' 150)
 CONTEXT_RESTART_TRIGGERED=false
 
 LAST_AUTO_REPLY=0
@@ -94,17 +107,32 @@ HUMAN_MSG_CHAT_ID=""
 TYPING_LAST_SENT=0
 HUMAN_MSG_PENDING_SINCE=0  # timestamp when last human msg arrived
 
-FROZEN_SOFT_NUDGE_SECONDS=120   # soft nudge (Ctrl+C + re-prompt) after 2 min
-FROZEN_RESTART_MAX_SECONDS=300  # hard-restart if agent busy for 5+ min with pending human msg
+FROZEN_SOFT_NUDGE_SECONDS=$(read_int_config '.frozen_soft_nudge_seconds' 120)
+FROZEN_RESTART_MAX_SECONDS=$(read_int_config '.frozen_restart_max_seconds' 300)
+FROZEN_SOFT_NUDGE_DISABLED=false
+FROZEN_RESTART_DISABLED=false
+if [[ "${FROZEN_SOFT_NUDGE_SECONDS}" -le 0 ]]; then
+    FROZEN_SOFT_NUDGE_SECONDS=0
+    FROZEN_SOFT_NUDGE_DISABLED=true
+fi
+if [[ "${FROZEN_RESTART_MAX_SECONDS}" -le 0 ]]; then
+    FROZEN_RESTART_MAX_SECONDS=0
+    FROZEN_RESTART_DISABLED=true
+fi
 FROZEN_NUDGE_SENT=0             # track whether we already sent a soft nudge (0=no, 1=yes)
 LAST_PANE_HASH=""               # track pane content changes for progress detection
 PANE_STALE_SINCE=0              # when pane content stopped changing
 PANE_UNCHANGED_SINCE=0         # for passive frozen detection
-PASSIVE_FROZEN_THRESHOLD=600   # 10 min of zero pane change while busy = frozen
+PASSIVE_FROZEN_THRESHOLD=$(read_int_config '.passive_frozen_threshold' 1800)
+PASSIVE_FROZEN_DISABLED=false
+if [[ "${PASSIVE_FROZEN_THRESHOLD}" -le 0 ]]; then
+    PASSIVE_FROZEN_THRESHOLD=0
+    PASSIVE_FROZEN_DISABLED=true
+fi
 PASSIVE_FROZEN_TRIGGERED=false
 # Live activity streaming state
 ACTIVITY_STREAMING=$(jq -r '.activity_streaming // false' "${AGENT_DIR}/config.json" 2>/dev/null || echo "false")
-ACTIVITY_INTERVAL=$(jq -r '.activity_interval_seconds // 8' "${AGENT_DIR}/config.json" 2>/dev/null || echo "8")
+ACTIVITY_INTERVAL=$(read_int_config '.activity_interval_seconds' 8)
 LAST_ACTIVITY=""
 LAST_ACTIVITY_SENT=0
 
@@ -126,7 +154,11 @@ do_hard_restart() {
             mkdir -p "${CRM_ROOT}/state"
             touch "${CRM_ROOT}/state/${AGENT}.force-fresh"
             rm -f "${CRM_ROOT}/state/${AGENT}.session-start"
-            nohup bash -c "sleep 10 && launchctl unload '${plist}' 2>/dev/null; sleep 1 && launchctl load '${plist}'" \
+            local user_id label restart_cmd
+            user_id=$(id -u)
+            label="com.claude-remote.${CRM_INSTANCE_ID}.${AGENT}"
+            restart_cmd="sleep 5; if launchctl print 'gui/${user_id}/${label}' >/dev/null 2>&1; then launchctl kickstart -k 'gui/${user_id}/${label}'; else launchctl unload '${plist}' 2>/dev/null; sleep 1; launchctl load '${plist}'; fi"
+            nohup bash -c "${restart_cmd}" \
                 >> "${CRM_ROOT}/logs/${AGENT}/restarts.log" 2>&1 &
             disown
             log "Fallback launchctl restart scheduled for ${AGENT}"
@@ -280,6 +312,10 @@ inject_messages() {
     # load-buffer reads the file into tmux's paste buffer (handles raw bytes).
     # paste-buffer uses bracketed paste mode to inject the content directly
     # into Claude's input field inline. Enter submits.
+    if is_agent_idle; then
+        tmux send-keys -t "${TMUX_SESSION}:0.0" C-u
+        sleep 0.1
+    fi
     tmux load-buffer -b "crm-${AGENT}" "$tmpfile"
     tmux paste-buffer -t "${TMUX_SESSION}:0.0" -b "crm-${AGENT}"
     sleep 0.3  # Let paste content land in PTY buffer before sending Enter
@@ -313,7 +349,7 @@ send_next_question() {
     fi
 
     local total_q q_text q_header q_multi q_options q_opt_count msg keyboard
-    total_q=$(jq -r '.total_questions // 1' "$state_file")
+    total_q=$(read_int_config '.total_questions' 1 "$state_file")
     q_text=$(jq -r ".questions[${q_idx}].question // \"Question\"" "$state_file")
     q_header=$(jq -r ".questions[${q_idx}].header // empty" "$state_file" || echo "")
     q_multi=$(jq -r ".questions[${q_idx}].multiSelect // false" "$state_file")
@@ -483,7 +519,7 @@ while true; do
 
                     # Check if there are more questions to send
                     if [[ -f "$ASK_STATE" ]]; then
-                        TOTAL_Q=$(jq -r '.total_questions // 1' "$ASK_STATE" 2>/dev/null)
+                        TOTAL_Q=$(read_int_config '.total_questions' 1 "$ASK_STATE")
                         NEXT_Q=$((Q_IDX + 1))
                         if [[ $NEXT_Q -lt $TOTAL_Q ]]; then
                             # Update state
@@ -569,7 +605,7 @@ Tap more options or Submit" '{"inline_keyboard":'"$(jq -c '.questions['"$Q_IDX"'
                         log "AskUserQuestion: Q${Q_IDX} submitted multi-select"
 
                         # Check for more questions
-                        TOTAL_Q=$(jq -r '.total_questions // 1' "$ASK_STATE" 2>/dev/null)
+                        TOTAL_Q=$(read_int_config '.total_questions' 1 "$ASK_STATE")
                         NEXT_Q=$((Q_IDX + 1))
                         # Reset multi_select_chosen for next question
                         jq '.multi_select_chosen = []' "$ASK_STATE" > "${ASK_STATE}.tmp" && mv "${ASK_STATE}.tmp" "$ASK_STATE"
@@ -642,7 +678,12 @@ Reply using: bash '${BUS_DIR}/send-telegram.sh' ${CHAT_ID} \"<your reply>\"
             elif [[ "$TYPE" == "voice" || "$TYPE" == "audio" ]]; then
                 AUDIO_PATH=$(echo "$line" | jq -r '.file_path // ""' 2>/dev/null || echo "")
                 AUDIO_NAME=$(echo "$line" | jq -r '.file_name // ""' 2>/dev/null || echo "")
-                MESSAGE_BLOCK+="=== TELEGRAM ${TYPE^^} from ${FROM} (chat_id:${CHAT_ID}) ===
+                case "$TYPE" in
+                    voice) TYPE_UPPER="VOICE" ;;
+                    audio) TYPE_UPPER="AUDIO" ;;
+                    *) TYPE_UPPER="MEDIA" ;;
+                esac
+                MESSAGE_BLOCK+="=== TELEGRAM ${TYPE_UPPER} from ${FROM} (chat_id:${CHAT_ID}) ===
 local_file: ${AUDIO_PATH}
 file_name: ${AUDIO_NAME}
 Reply using: bash '${BUS_DIR}/send-telegram.sh' ${CHAT_ID} \"<your reply>\"
@@ -798,7 +839,7 @@ Reply using: bash '${BUS_DIR}/send-message.sh' ${FROM} normal '<your reply>' ${M
             STALE_AGE=$(( NOW_TS - PANE_STALE_SINCE ))
 
             # Stage 1: Soft nudge — only if pane stale for 2+ min (no tool output changing)
-            if (( PANE_STALE_SINCE > 0 && STALE_AGE >= FROZEN_SOFT_NUDGE_SECONDS && FROZEN_NUDGE_SENT == 0 )); then
+            if [[ "$FROZEN_SOFT_NUDGE_DISABLED" != "true" ]] && (( PANE_STALE_SINCE > 0 && STALE_AGE >= FROZEN_SOFT_NUDGE_SECONDS && FROZEN_NUDGE_SENT == 0 )); then
                 log "FROZEN NUDGE: pane stale for ${STALE_AGE}s — sending Ctrl+C and re-prompt"
                 FROZEN_NUDGE_SENT=1
                 tmux send-keys -t "${TMUX_SESSION}:0.0" C-c
@@ -808,7 +849,7 @@ Reply using: bash '${BUS_DIR}/send-message.sh' ${FROM} normal '<your reply>' ${M
             fi
 
             # Stage 2: Hard restart — only if stale for 5+ min (nudge didn't help)
-            if (( PANE_STALE_SINCE > 0 && STALE_AGE >= FROZEN_RESTART_MAX_SECONDS )); then
+            if [[ "$FROZEN_RESTART_DISABLED" != "true" ]] && (( PANE_STALE_SINCE > 0 && STALE_AGE >= FROZEN_RESTART_MAX_SECONDS )); then
                 log "FROZEN DETECTED: pane stale for ${STALE_AGE}s — hard-restarting"
                 telegram_api_post "sendMessage" \
                     -H "Content-Type: application/json" \
@@ -840,7 +881,7 @@ Reply using: bash '${BUS_DIR}/send-message.sh' ${FROM} normal '<your reply>' ${M
             LAST_PANE_HASH="$CURRENT_PANE_HASH"
             PANE_UNCHANGED_SINCE=$NOW_TS
             PASSIVE_FROZEN_TRIGGERED=false
-        elif [[ "$PASSIVE_FROZEN_TRIGGERED" == "false" ]] && (( PANE_UNCHANGED_SINCE > 0 )); then
+        elif [[ "$PASSIVE_FROZEN_DISABLED" != "true" ]] && [[ "$PASSIVE_FROZEN_TRIGGERED" == "false" ]] && (( PANE_UNCHANGED_SINCE > 0 )); then
             STALE_DURATION=$(( NOW_TS - PANE_UNCHANGED_SINCE ))
             if ! is_agent_idle && (( STALE_DURATION >= PASSIVE_FROZEN_THRESHOLD )); then
                 log "PASSIVE FROZEN: pane unchanged for ${STALE_DURATION}s while agent busy — hard-restarting"

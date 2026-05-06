@@ -152,23 +152,59 @@ for dir in "${SCAN_DIRS[@]}"; do
         echo "${SEEN}" | grep -q "^${cmd}$" && continue
         SEEN="${SEEN}${cmd}"$'\n'
 
-        # jq handles all JSON escaping; truncate description to Telegram's limit
+        # Telegram counts bytes. Keep a small UTF-8 safety margin.
+        TRUNC_DESC=$(printf '%s' "${desc}" | LC_ALL=C cut -b1-253)
         COMMANDS_JSON=$(echo "${COMMANDS_JSON}" | jq \
             --arg cmd "${cmd}" \
-            --arg desc "$(echo "${desc}" | cut -c1-256)" \
+            --arg desc "${TRUNC_DESC}" \
             '. + [{"command": $cmd, "description": $desc}]')
     done <<< "$(collect_skill_files "${dir}")"
 done
 
 # --- Register with Telegram ---
-COUNT=$(echo "${COMMANDS_JSON}" | jq 'length')
+TOTAL_FOUND=$(echo "${COMMANDS_JSON}" | jq 'length')
 
-if [[ "${COUNT}" -eq 0 ]]; then
+if [[ "${TOTAL_FOUND}" -eq 0 ]]; then
     echo "No commands found to register"
     exit 0
 fi
 
+MAX_PAYLOAD_BYTES=6500
+COMMANDS_JSON=$(echo "${COMMANDS_JSON}" | jq '.[0:100]')
+
+payload_bytes_for() {
+    local payload
+    payload=$(jq -n --argjson cmds "$1" '{"commands": $cmds}')
+    printf '%s' "${payload}" | LC_ALL=C wc -c | tr -d ' '
+}
+
+UPPER=$(echo "${COMMANDS_JSON}" | jq 'length')
+LO=0
+HI=${UPPER}
+while (( LO < HI )); do
+    MID=$(( (LO + HI + 1) / 2 ))
+    CANDIDATE=$(echo "${COMMANDS_JSON}" | jq --argjson n "${MID}" '.[0:$n]')
+    BYTES=$(payload_bytes_for "${CANDIDATE}")
+    if [[ "${BYTES}" -le "${MAX_PAYLOAD_BYTES}" ]]; then
+        LO=${MID}
+    else
+        HI=$(( MID - 1 ))
+    fi
+done
+
+COUNT=${LO}
+if [[ "${COUNT}" -eq 0 ]]; then
+    echo "WARNING: even one Telegram command exceeds ${MAX_PAYLOAD_BYTES} bytes; skipping registration" >&2
+    exit 0
+fi
+
+COMMANDS_JSON=$(echo "${COMMANDS_JSON}" | jq --argjson n "${COUNT}" '.[0:$n]')
 PAYLOAD=$(jq -n --argjson cmds "${COMMANDS_JSON}" '{"commands": $cmds}')
+
+if [[ "${COUNT}" -lt "${TOTAL_FOUND}" ]]; then
+    echo "Note: ${TOTAL_FOUND} commands found, registering first ${COUNT}"
+fi
+
 RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
     -H "Content-Type: application/json" \
     -d "${PAYLOAD}")

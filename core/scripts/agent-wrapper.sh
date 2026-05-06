@@ -81,14 +81,27 @@ if [[ ${CRASH_COUNT} -ge ${MAX_CRASHES_PER_DAY} ]]; then
     exit 1
 fi
 
+read_int_config() {
+    local key="$1"
+    local default="$2"
+    local file="${3:-${AGENT_DIR}/config.json}"
+    local result
+    result=$(jq -r "(${key} // ${default}) | (tonumber? // ${default}) | if . > 2147483647 then 2147483647 elif . < -2147483648 then -2147483648 else floor end" \
+        "${file}" 2>/dev/null) || result="${default}"
+    if [[ ! "${result}" =~ ^-?[0-9]+$ ]]; then
+        result="${default}"
+    fi
+    printf '%s' "${result}"
+}
+
 # Staggered startup delay to avoid simultaneous API hits
-DELAY=$(jq -r '.startup_delay // 0' "${AGENT_DIR}/config.json" 2>/dev/null || echo "0")
+DELAY=$(read_int_config '.startup_delay' 0)
 sleep ${DELAY}
 
 # Session duration: config override, or default 71 hours (255600s)
 # /loop crons expire at 72h, so we restart 1h before that
 # Set "max_session_seconds" in config.json for testing (e.g. 300)
-MAX_SESSION=$(jq -r '.max_session_seconds // 255600' "${AGENT_DIR}/config.json" 2>/dev/null || echo "255600")
+MAX_SESSION=$(read_int_config '.max_session_seconds' 255600)
 
 # Model override: set "model" in config.json (e.g. "claude-haiku-4-5-20251001")
 MODEL=$(jq -r '.model // empty' "${AGENT_DIR}/config.json" 2>/dev/null || echo "")
@@ -318,9 +331,6 @@ graceful_shutdown() {
         kill "${FAST_PID}" 2>/dev/null || true
     fi
     if tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
-        tmux send-keys -t "${TMUX_SESSION}:0.0" \
-            "SYSTEM SHUTDOWN: SIGTERM received. Session ending in 30 seconds. Save your work NOW." Enter
-        sleep 30
         tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
     fi
     exit 0

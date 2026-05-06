@@ -147,6 +147,8 @@ permissions consistent across launchd starts and `self-restart.sh`.
 
 ```bash
 bash -n core/bus/*.sh core/scripts/*.sh scripts/*.sh
+bash tests/smoke-bash-syntax.sh
+bash tests/check-telegram-offset.test.sh
 bash tests/restart-flow.test.sh
 ```
 

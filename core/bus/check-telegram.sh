@@ -62,7 +62,8 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
         from: .message.from.first_name,
         text: .message.text,
         date: .message.date,
-        type: "message"
+        type: "message",
+        reply_to_text: (.message.reply_to_message.text // null)
     }'
 
     # Handle photo messages: download largest size and output with local path
@@ -77,7 +78,9 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
         FILE_PATH=$(echo "${FILE_RESPONSE}" | jq -r '.result.file_path // empty')
 
         if [[ -n "${FILE_PATH}" ]]; then
-            LOCAL_FILE="${IMAGE_DIR}/${DATE_VAL}.jpg"
+            # Use unique suffix from file_path to prevent overwrite in media groups
+            UNIQUE_SUFFIX=$(echo "${FILE_PATH}" | sed 's|.*/||;s|\..*||' | tail -c 12)
+            LOCAL_FILE="${IMAGE_DIR}/${DATE_VAL}_${UNIQUE_SUFFIX}.jpg"
             telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
 
             jq -nc \
@@ -94,6 +97,130 @@ if [[ "${MSG_COUNT}" -gt 0 ]]; then
         caption: (.message.caption // ""),
         date: .message.date,
         file_id: (.message.photo | last | .file_id)
+    }')
+
+    # Handle document/file messages: download and output with local path
+    DOC_DIR="${TEMPLATE_ROOT}/agents/${ME}/telegram-docs"
+    mkdir -p "${DOC_DIR}"
+    while IFS= read -r doc_msg; do
+        [[ -z "$doc_msg" ]] && continue
+        CHAT_ID_VAL=$(echo "${doc_msg}" | jq -r '.chat_id')
+        FROM_VAL=$(echo "${doc_msg}" | jq -r '.from')
+        DATE_VAL=$(echo "${doc_msg}" | jq -r '.date')
+        CAPTION_VAL=$(echo "${doc_msg}" | jq -r '.caption // ""')
+        FILE_ID=$(echo "${doc_msg}" | jq -r '.file_id')
+        FILE_NAME=$(echo "${doc_msg}" | jq -r '.file_name // "document"')
+
+        FILE_RESPONSE=$(telegram_api_get "getFile?file_id=${FILE_ID}" 2>/dev/null || echo '{"ok":false}')
+        FILE_PATH=$(echo "${FILE_RESPONSE}" | jq -r '.result.file_path // empty')
+
+        if [[ -n "${FILE_PATH}" ]]; then
+            LOCAL_FILE="${DOC_DIR}/${DATE_VAL}_${FILE_NAME}"
+            telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
+
+            jq -nc \
+                --arg chat_id "${CHAT_ID_VAL}" \
+                --arg from "${FROM_VAL}" \
+                --arg caption "${CAPTION_VAL}" \
+                --argjson date "${DATE_VAL}" \
+                --arg file_path "${LOCAL_FILE}" \
+                --arg file_name "${FILE_NAME}" \
+                '{chat_id: ($chat_id | tonumber), from: $from, text: $caption, file_path: $file_path, file_name: $file_name, date: $date, type: "document"}'
+        fi
+    done < <(echo "${MESSAGES}" | jq -c '.[] | select(.message.document) | {
+        chat_id: .message.chat.id,
+        from: .message.from.first_name,
+        caption: (.message.caption // ""),
+        date: .message.date,
+        file_id: .message.document.file_id,
+        file_name: .message.document.file_name
+    }')
+
+    # Handle audio messages: download and output with local path
+    while IFS= read -r audio_msg; do
+        CHAT_ID_VAL=$(echo "${audio_msg}" | jq -r '.chat_id')
+        FROM_VAL=$(echo "${audio_msg}" | jq -r '.from')
+        DATE_VAL=$(echo "${audio_msg}" | jq -r '.date')
+        FILE_ID=$(echo "${audio_msg}" | jq -r '.file_id')
+        FILE_NAME=$(echo "${audio_msg}" | jq -r '.file_name')
+
+        FILE_RESPONSE=$(telegram_api_get "getFile?file_id=${FILE_ID}" 2>/dev/null || echo '{"ok":false}')
+        FILE_PATH=$(echo "${FILE_RESPONSE}" | jq -r '.result.file_path // empty')
+
+        if [[ -n "${FILE_PATH}" ]]; then
+            LOCAL_FILE="${IMAGE_DIR}/${FILE_NAME}"
+            telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
+
+            jq -nc \
+                --arg chat_id "${CHAT_ID_VAL}" \
+                --arg from "${FROM_VAL}" \
+                --argjson date "${DATE_VAL}" \
+                --arg file_path "${LOCAL_FILE}" \
+                --arg file_name "${FILE_NAME}" \
+                '{chat_id: ($chat_id | tonumber), from: $from, text: "", file_path: $file_path, file_name: $file_name, date: $date, type: "audio"}'
+        fi
+    done < <(echo "${MESSAGES}" | jq -c '.[] | select(.message.audio) | {
+        chat_id: .message.chat.id,
+        from: .message.from.first_name,
+        date: .message.date,
+        file_id: .message.audio.file_id,
+        file_name: (.message.audio.file_name // ("audio_" + (.message.date | tostring) + ".ogg"))
+    }')
+
+    # Handle voice messages: download and output with local path
+    while IFS= read -r voice_msg; do
+        CHAT_ID_VAL=$(echo "${voice_msg}" | jq -r '.chat_id')
+        FROM_VAL=$(echo "${voice_msg}" | jq -r '.from')
+        DATE_VAL=$(echo "${voice_msg}" | jq -r '.date')
+        FILE_ID=$(echo "${voice_msg}" | jq -r '.file_id')
+
+        FILE_RESPONSE=$(telegram_api_get "getFile?file_id=${FILE_ID}" 2>/dev/null || echo '{"ok":false}')
+        FILE_PATH=$(echo "${FILE_RESPONSE}" | jq -r '.result.file_path // empty')
+
+        if [[ -n "${FILE_PATH}" ]]; then
+            LOCAL_FILE="${IMAGE_DIR}/voice_${DATE_VAL}.ogg"
+            telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
+
+            jq -nc \
+                --arg chat_id "${CHAT_ID_VAL}" \
+                --arg from "${FROM_VAL}" \
+                --argjson date "${DATE_VAL}" \
+                --arg file_path "${LOCAL_FILE}" \
+                '{chat_id: ($chat_id | tonumber), from: $from, text: "", file_path: $file_path, date: $date, type: "voice"}'
+        fi
+    done < <(echo "${MESSAGES}" | jq -c '.[] | select(.message.voice) | {
+        chat_id: .message.chat.id,
+        from: .message.from.first_name,
+        date: .message.date,
+        file_id: .message.voice.file_id
+    }')
+
+    # Handle video_note messages (round video): download and output with local path
+    while IFS= read -r vnote_msg; do
+        CHAT_ID_VAL=$(echo "${vnote_msg}" | jq -r '.chat_id')
+        FROM_VAL=$(echo "${vnote_msg}" | jq -r '.from')
+        DATE_VAL=$(echo "${vnote_msg}" | jq -r '.date')
+        FILE_ID=$(echo "${vnote_msg}" | jq -r '.file_id')
+
+        FILE_RESPONSE=$(telegram_api_get "getFile?file_id=${FILE_ID}" 2>/dev/null || echo '{"ok":false}')
+        FILE_PATH=$(echo "${FILE_RESPONSE}" | jq -r '.result.file_path // empty')
+
+        if [[ -n "${FILE_PATH}" ]]; then
+            LOCAL_FILE="${IMAGE_DIR}/videonote_${DATE_VAL}.mp4"
+            telegram_file_download "${FILE_PATH}" "${LOCAL_FILE}" 2>/dev/null || true
+
+            jq -nc \
+                --arg chat_id "${CHAT_ID_VAL}" \
+                --arg from "${FROM_VAL}" \
+                --argjson date "${DATE_VAL}" \
+                --arg file_path "${LOCAL_FILE}" \
+                '{chat_id: ($chat_id | tonumber), from: $from, text: "", file_path: $file_path, date: $date, type: "video_note"}'
+        fi
+    done < <(echo "${MESSAGES}" | jq -c '.[] | select(.message.video_note) | {
+        chat_id: .message.chat.id,
+        from: .message.from.first_name,
+        date: .message.date,
+        file_id: .message.video_note.file_id
     }')
 
     # Output callback queries (inline button presses)

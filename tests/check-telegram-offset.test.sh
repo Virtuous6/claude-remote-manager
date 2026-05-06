@@ -56,6 +56,7 @@ cat > "${TMP}/message.json" <<'JSON'
         "chat": {"id": 999},
         "from": {"id": 123, "first_name": "Joe"},
         "text": "hi",
+        "reply_to_message": {"text": "prev"},
         "date": 1778060000
       }
     }
@@ -67,13 +68,13 @@ export FAKE_TG_RESPONSE="${TMP}/message.json"
 OFFSET_DEFER_FILE="${TMP}/offset-defer"
 MESSAGE_OUTPUT=$(CRM_DEFER_TELEGRAM_OFFSET_FILE="${OFFSET_DEFER_FILE}" bash "${ROOT}/core/bus/check-telegram.sh")
 
-printf '%s\n' "${MESSAGE_OUTPUT}" | jq -e 'select(.text == "hi" and .type == "message")' >/dev/null || fail "message output missing"
+printf '%s\n' "${MESSAGE_OUTPUT}" | jq -e 'select(.text == "hi" and .reply_to_text == "prev" and .type == "message")' >/dev/null || fail "message output missing"
 grep -Fxq "__OFFSET__:42" "${OFFSET_DEFER_FILE}" || fail "deferred offset missing"
 [[ ! -f "${CRM_ROOT}/state/.telegram-offset-${CRM_AGENT_NAME}" ]] || fail "deferred path wrote offset directly"
 
 unset CRM_DEFER_TELEGRAM_OFFSET_FILE
 STANDALONE_OUTPUT=$(bash "${ROOT}/core/bus/check-telegram.sh")
-printf '%s\n' "${STANDALONE_OUTPUT}" | jq -e 'select(.text == "hi" and .type == "message")' >/dev/null || fail "standalone output missing"
+printf '%s\n' "${STANDALONE_OUTPUT}" | jq -e 'select(.text == "hi" and .reply_to_text == "prev" and .type == "message")' >/dev/null || fail "standalone output missing"
 grep -Fxq "42" "${CRM_ROOT}/state/.telegram-offset-${CRM_AGENT_NAME}" || fail "standalone offset missing"
 
 echo "PASS: check telegram offset"
