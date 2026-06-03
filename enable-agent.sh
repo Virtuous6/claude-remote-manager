@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-TEMPLATE_ROOT="$(cd "$(dirname "$0")" && pwd)"
+TEMPLATE_ROOT="$(cd "$(dirname "$0")" && pwd -P)"
 
 # Load instance ID
 REPO_ENV="${TEMPLATE_ROOT}/.env"

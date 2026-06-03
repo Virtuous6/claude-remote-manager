@@ -205,7 +205,7 @@ if [[ "${COUNT}" -lt "${TOTAL_FOUND}" ]]; then
     echo "Note: ${TOTAL_FOUND} commands found, registering first ${COUNT}"
 fi
 
-RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
+RESPONSE=$(curl -s --connect-timeout 5 --max-time 15 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands" \
     -H "Content-Type: application/json" \
     -d "${PAYLOAD}")
 

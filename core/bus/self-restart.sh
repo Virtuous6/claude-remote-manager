@@ -10,8 +10,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TEMPLATE_ROOT="${CRM_TEMPLATE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+TEMPLATE_ROOT="${CRM_TEMPLATE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd -P)}"
 AGENT="${CRM_AGENT_NAME:-$(basename "$(pwd)")}"
 AGENT_DIR="${TEMPLATE_ROOT}/agents/${AGENT}"
 

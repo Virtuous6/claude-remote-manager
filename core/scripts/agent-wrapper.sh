@@ -17,7 +17,9 @@
 set -euo pipefail
 
 AGENT="$1"
-TEMPLATE_ROOT="$2"
+# Canonicalize to the physical path so a ~/Documents symlink can never poison
+# child cwd / launchd invocations under macOS TCC (Full Disk Access denials).
+TEMPLATE_ROOT="$(cd "$2" && pwd -P)"
 
 # Load instance ID from repo .env or environment
 REPO_ENV="${TEMPLATE_ROOT}/.env"
@@ -184,12 +186,21 @@ CONTINUE_PROMPT="SESSION CONTINUATION: Your CLI process was restarted with --con
 # Without the marker, launchd respawns always use --continue to preserve conversation history.
 FORCE_FRESH_MARKER="${CRM_ROOT}/state/${AGENT}.force-fresh"
 
-cd "${LAUNCH_DIR}"
+# Stay in an FDA-safe directory. The launchd wrapper itself lacks macOS Full Disk
+# Access, so if its cwd is under ~/Documents, getcwd() fails (EPERM) and every tmux
+# client it forks hangs. Claude gets the real working dir from the in-pane launcher
+# (cd "${LAUNCH_DIR}" in write_claude_launcher), which runs as a child of the tmux
+# server — and that server DOES have Full Disk Access. Do NOT cd into LAUNCH_DIR here.
+cd "${TEMPLATE_ROOT}"
 
 # Determine start mode
 # Check if there's actually a conversation to continue by looking for .jsonl files
 # in Claude's project conversation directory (based on the actual launch directory).
 CONV_DIR="${HOME}/.claude/projects/-$(echo "${LAUNCH_DIR}" | tr '/' '-')"
+HISTORY_SANITIZER="${TEMPLATE_ROOT}/core/scripts/sanitize-claude-history.sh"
+if [[ -d "${CONV_DIR}" && -f "${HISTORY_SANITIZER}" ]]; then
+    bash "${HISTORY_SANITIZER}" "${CONV_DIR}" >> "${LOG_DIR}/activity.log" 2>&1 || true
+fi
 HAS_CONVERSATION=false
 if [[ -d "${CONV_DIR}" ]] && ls "${CONV_DIR}"/*.jsonl &>/dev/null; then
     HAS_CONVERSATION=true
@@ -211,8 +222,11 @@ echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) Starting ${AGENT} mode=${START_MODE} (sessi
 if [[ -n "${BOT_TOKEN:-}" ]]; then
     REGISTER_SCRIPT="${TEMPLATE_ROOT}/core/scripts/register-telegram-commands.sh"
     if [[ -f "${REGISTER_SCRIPT}" ]]; then
-        bash "${REGISTER_SCRIPT}" "${BOT_TOKEN}" "${LAUNCH_DIR}" "${AGENT_DIR}" \
-            >> "${LOG_DIR}/activity.log" 2>&1 || true
+        # Run in the background: command registration is cosmetic (Telegram
+        # autocomplete) and must NEVER block the boot path. A hang here used to
+        # wedge the whole agent before tmux/Claude ever started.
+        ( bash "${REGISTER_SCRIPT}" "${BOT_TOKEN}" "${LAUNCH_DIR}" "${AGENT_DIR}" \
+            >> "${LOG_DIR}/activity.log" 2>&1 || true ) &
     fi
 fi
 

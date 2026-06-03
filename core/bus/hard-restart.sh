@@ -7,8 +7,8 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TEMPLATE_ROOT="${CRM_TEMPLATE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+TEMPLATE_ROOT="${CRM_TEMPLATE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd -P)}"
 AGENT="${CRM_AGENT_NAME:-$(basename "$(pwd)")}"
 
 # Load instance ID
@@ -38,6 +38,9 @@ rm -f "${LOG_DIR}/.crash_count_today"
 # Write force-fresh marker so agent-wrapper.sh uses STARTUP_PROMPT (no --continue)
 mkdir -p "${CRM_ROOT}/state"
 touch "${CRM_ROOT}/state/${AGENT}.force-fresh"
+
+# Clear context tracking state so new session starts fresh
+rm -f "${CRM_ROOT}/state/${AGENT}.session-start"
 
 # Detach so the current Claude/tool call can exit before launchd kills it.
 USER_ID=$(id -u)

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 AGENT="$1"
-TEMPLATE_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+TEMPLATE_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
 AGENT_DIR="${TEMPLATE_ROOT}/agents/${AGENT}"
 CONFIG_FILE="${AGENT_DIR}/config.json"
 
