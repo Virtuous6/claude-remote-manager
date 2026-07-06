@@ -13,3 +13,7 @@ agents/*/telegram-images/
 agents/*/memory/
 agents/*/.playwright-mcp/
 agents/jimbo/
+
+# Files received via Telegram (data, not code) + local config backups
+agents/*/telegram-docs/
+agents/*/config.json.bak-*

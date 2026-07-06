@@ -1,8 +1,13 @@
 {
   "agent_name": "steve-kingsley",
-  "enabled": false,
+  "enabled": true,
   "startup_delay": 0,
   "max_session_seconds": 255600,
+  "context_max_hours": 100000,
+  "context_max_injections": 100000,
+  "frozen_soft_nudge_seconds": 120,
+  "frozen_restart_max_seconds": 300,
+  "passive_frozen_threshold": 3600,
   "working_directory": "/Users/josephsanchez/Documents/repos/power-assistant-joe",
   "crons": [
     {
@@ -24,6 +29,11 @@
       "name": "inbox-check",
       "cron": "*/5 8-18 * * 1-5",
       "prompt": "Check agent inbox for new messages. Run: bash \"$CRM_TEMPLATE_ROOT/core/bus/check-inbox.sh\" — if there are new messages, process them and respond. If empty, do nothing."
+    },
+    {
+      "name": "rachel-daily-fact",
+      "cron": "5 12 * * *",
+      "prompt": "Rachel's daily local-history fact (Joe-requested ritual, ends 2026-07-24). Get today's date in America/Denver. If today is after 2026-07-24, do nothing. Read /Users/josephsanchez/Documents/OBSIDIAN/Lucky Obsidian/_CC/joe/rachel-daily-history-sent.csv — if it already has a row for today, stop (already sent today). Otherwise read /Users/josephsanchez/Documents/OBSIDIAN/Lucky Obsidian/_CC/joe/area-history.csv and pick the next fact whose title is NOT yet in the sent csv, in csv order. Send it to Rachel via Beeper Google Messages, chatID 199062, using mcp__beeper__send_message, as a short warm today's-bit-of-local-history message with the fact. Then append a row to rachel-daily-history-sent.csv: today's date, fact title, a concise summary, source. If the fact pool is exhausted, web-research one fresh Hurricane / Zion / Washington County UT historical fact, send it, and append it to BOTH csvs. Do not message Joe unless it fails."
     },
     {
       "name": "rp-gather",

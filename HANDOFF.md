@@ -1,45 +1,36 @@
 # Claude Remote Manager — Handoff
-**Date:** 2026-04-03
-**Session:** PA integration — Steve's working_directory = PA repo, slim CLAUDE.md overlay
+**Date:** 2026-07-06
+**Session:** Steve 52h outage — TCC/FDA root cause, dead-pane guard, backlog committed
 
 ---
 
 ## TL;DR
 
-Steve is now a thin Telegram overlay on the PA repo — one system, two interfaces. Committed and pushed to `Virtuous6/claude-remote-manager`.
+Steve was dead Jul 4 06:00 → Jul 6 10:01. The 71h session-refresh relaunch died instantly with `error: An internal error occurred (EPERM)`; pane fell to bash and fast-checker pasted Joe's Telegram messages INTO bash (executed as shell commands). Root cause: tmux had an explicit Full Disk Access DENY in TCC — any claude with cwd under `~/Documents` EPERMs at startup in the tmux-server context. Fixed by granting tmux FDA (System Settings) + hard-restart. Dead-pane guard added to fast-checker.
 
 ---
 
 ## What's Done (This Session)
 
-- Set `working_directory` in `config.json` to `/Users/josephsanchez/Documents/repos/power-assistant-joe` — PA CLAUDE.md loads automatically
-- Rewrote `agents/steve-kingsley/CLAUDE.md` from 153 lines to 87 — stripped all duplicated PA content (identity, skills, rules, paths, activity logging), kept only Telegram-specific ops
-- Updated cron prompts to use relative paths (`orchestration/workflows/...`) instead of absolute `~/.claude/` paths
-- Fixed old `power assistant/` vault paths that would have broken Steve (deleted folder)
-- Fixed tag format: `LEVANTAGE`/`NEUSTAC`/`PERSONAL` → `LEV`/`NEU`/`PER`
-- Fixed brief path: hardcoded `2026/03/` → dynamic `{YYYY}/{MM}/` with `_CC/` prefix
-- Forked repo to `Virtuous6/claude-remote-manager`, set origin, pushed
-- Added `.playwright-mcp/` to `.gitignore`
+- Root-caused the EPERM: reproduced in a scratch window of the live server (`ls ~/Documents` fails; claude with cwd `~/repos` boots, cwd `~/Documents/...` dies — any version).
+- Joe granted `/opt/homebrew/Cellar/tmux/3.6a/bin/tmux` FDA 10:00; hard-restart 10:01; verified DOCS_OK, clean boot, Telegram commands registered.
+- `inject_messages()` dead-pane guard: refuses to paste when `pane_current_command` is a shell; does NOT commit Telegram offset (message retries after recovery). Deny-lists shells — claude shows as version basename (`2.1.201`), allow-list would false-refuse.
+- Committed the dirty worktree (was uncommitted since ~May): is_agent_idle spinner fix, dead-pane guard, sanitize-claude-history + test, live steve config (incl. rachel-daily-fact cron), gitignore for telegram-docs/ + config backups.
 
 ---
 
 ## What's Next
 
-### Priority 1: Test Steve with new working_directory
-**What:** Enable Steve, verify PA CLAUDE.md loads, crons fire, Telegram works
-**Depends on:** MCP auth may need manual approval (attach to tmux)
+### Priority 1: Watch Thu Jul 9 ~10am session refresh
+**What:** First natural exercise of the timer-continue path since the fix. If Steve survives, case closed.
+**Files:** `~/.claude-remote/default/logs/steve-kingsley/crashes.log`, `activity.log`
 
-### Priority 2: Verify cron relative paths work
-**What:** Cron prompts now say `orchestration/workflows/agent-work-loop/SKILL.md` (relative). Confirm CRM resolves these from working_directory.
-**Depends on:** Priority 1
+### Priority 2: Relaunch retry in agent-wrapper
+**What:** Timer-refresh relaunch is one-shot (`agent-wrapper.sh` ~line 376). One transient failure = dead until noticed. Add retry + fall back to fresh + Telegram alert on final failure.
+**Files:** `core/scripts/agent-wrapper.sh`
 
-### Priority 3: Consider consolidating Desktop + Steve crons
-**What:** Desktop runs morning brief, guardian, pulse, weekly, monthly, contact builder. Steve runs agent-work-loop, beeper-monitor, inbox-check. Document which runs where and why.
-**Depends on:** Nothing
-
-### Priority 4: Steve is disabled
-**What:** `config.json` has `"enabled": false`. Need to enable when ready to test.
-**Depends on:** Priority 1
+### Priority 3: Homebrew tmux upgrade will break the FDA grant
+**What:** Grant is keyed to the Cellar path/binary. `brew upgrade tmux` → new path → grant dead → same outage. Re-grant after upgrades. Check: `sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" "SELECT client,auth_value FROM access WHERE service='kTCCServiceSystemPolicyAllFiles' AND client LIKE '%tmux%';"` (2=allowed).
 
 ---
 
@@ -47,28 +38,15 @@ Steve is now a thin Telegram overlay on the PA repo — one system, two interfac
 
 | Decision | Rationale |
 |----------|-----------|
-| working_directory = PA repo | PA CLAUDE.md loads automatically, all PA changes flow to Steve for free |
-| Steve CLAUDE.md = CRM-only overlay | Eliminates dual maintenance — identity, skills, paths all inherited from PA |
-| Crons use relative paths | Resolved from working_directory, no hardcoded absolute paths to break |
-| Desktop runs file-only tasks, Steve runs Telegram-output tasks | Clean split — Desktop writes briefs, Steve surfaces them to Joe's phone |
-| Forked to Virtuous6 | Can't push to grandamenium upstream, need our own remote |
-
----
-
-## Blockers
-
-| Blocker | Impact | Who/What Unblocks |
-|---------|--------|-------------------|
-| Steve disabled | Can't test integration | `./enable-agent.sh steve-kingsley` |
-| MCP auth on first boot | Steve may lack Gmail/Calendar/Beeper | Attach to tmux, approve prompts |
-
----
+| Grant FDA to tmux binary | Server context needs Documents (Steve cwd + vault). Wrapper-side avoidance (c1776b9) can't cover in-pane claude |
+| Dead-pane guard deny-lists shells | Fails closed on the actual hazard; claude's pane command name is version-dependent |
+| Guard runs before dedup write | Otherwise a refused message would be dedup-skipped on retry |
+| Commit live config.json | Agents-are-files: board truth in git; private repo |
 
 ## Open Questions
 
-1. Do CRM cron prompts resolve relative paths from working_directory or from the agent directory?
-2. Should Steve also run morning brief / guardian, or keep that split with Desktop?
-3. Steve's `scheduled_tasks.lock` — should it be gitignored?
+1. Why did Documents access work Jun 30→Jul 4 then stop? No OS update, no TCC row change in window. Unresolved — fix holds regardless.
+2. Merge `joe/canonical-crm-symlink` → main done locally this session; delete branch after Thu proves stable?
 
 ---
 
@@ -76,19 +54,7 @@ Steve is now a thin Telegram overlay on the PA repo — one system, two interfac
 
 | File | Purpose |
 |------|---------|
-| `agents/steve-kingsley/CLAUDE.md` | Telegram-only overlay (87 lines) |
-| `agents/steve-kingsley/config.json` | working_directory + 4 crons |
-| `agents/steve-kingsley/.env` | Bot token + chat ID (gitignored) |
-| `repos/power-assistant-joe/CLAUDE.md` | PA operating manual (auto-loaded via working_directory) |
-
----
-
-## Suggested Next Session Flow
-
-1. `/pickup` — read this handoff
-2. `./enable-agent.sh steve-kingsley` — start Steve
-3. Attach to tmux (`tmux attach -t crm-default-steve-kingsley`), approve MCP auth if prompted
-4. Send Steve a test message on Telegram — verify PA identity loads
-5. Wait for a cron to fire — verify relative path resolution
-6. If working: commit any fixes, update memory
-7. If broken: check if cron paths resolve from working_directory or agent directory, fix accordingly
+| `core/scripts/fast-checker.sh` | Telegram poller, watchdog, dead-pane guard |
+| `core/scripts/agent-wrapper.sh` | launchd wrapper, tmux lifecycle, 71h refresh (one-shot relaunch — P2) |
+| `agents/steve-kingsley/config.json` | Steve thresholds/crons/working directory |
+| `~/.claude-remote/default/logs/steve-kingsley/` | crashes.log, restarts.log, activity.log, fast-checker.log |
