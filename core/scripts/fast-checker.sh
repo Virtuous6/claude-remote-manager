@@ -287,6 +287,22 @@ DEDUP_FILE="${CRM_ROOT}/state/${AGENT}.dedup"
 inject_messages() {
     local content="$1"
 
+    # --- Dead-pane guard ---
+    # If Claude has exited, the pane is a bare shell and anything pasted here
+    # gets EXECUTED as shell commands (observed 2026-07-06: Telegram text ran
+    # in bash-3.2 after a failed timer-continue relaunch). Refuse so the caller
+    # does NOT commit the Telegram offset — the message is retried once the
+    # agent is back. Must run before the dedup write, or the retry would be
+    # dedup-skipped.
+    local pane_cmd
+    pane_cmd=$(tmux display-message -p -t "${TMUX_SESSION}:0.0" '#{pane_current_command}' 2>/dev/null || echo "")
+    case "$pane_cmd" in
+        bash|zsh|sh|dash|fish|"")
+            log "DEAD PANE: pane running '${pane_cmd:-none}', not Claude — refusing to inject (agent needs restart)"
+            return 1
+            ;;
+    esac
+
     # --- Dedup check (Fix 8) ---
     local msg_hash=""
     # shasum is always available on macOS; md5/md5sum may not be
