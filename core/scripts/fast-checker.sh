@@ -168,15 +168,25 @@ do_hard_restart() {
     fi
 }
 
-# Check if agent is idle by looking at the Claude Code prompt marker.
-# Claude Code v2 uses a chevron prompt; older builds used ">".
+# Check whether the agent is idle (waiting at the prompt) vs busy (processing).
+#
+# NOTE: Claude Code's TUI renders the input box (❯ prompt) at ALL times, so the
+# presence of the chevron does NOT mean idle — the old check did exactly that and
+# therefore read EVERY quiet stretch as "busy", tripping passive-frozen and
+# hard-restarting an agent that was simply waiting (worst on weekends when no
+# crons touch the pane). The reliable distinction is the live spinner/status line,
+# shown ONLY while working: an elapsed timer in parens ("(3s", "(4m 58s"), a
+# streaming token counter ("… 16.5k tokens)"), or the "esc to interrupt" hint.
+# When the turn ends that line disappears and only the prompt box + footer remain.
+#
+# Returns 0 (idle) when no busy indicator is visible, 1 (busy) otherwise.
 is_agent_idle() {
-    local pane_bottom chevron
-    pane_bottom=$(tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>/dev/null | grep -v '^$' | tail -5)
-    chevron=$(printf '\342\235\257')
-
-    echo "$pane_bottom" | grep -q "${chevron}" && return 0
-    echo "$pane_bottom" | grep -qE '^[[:space:]]*>[[:space:]]*$'
+    local tail_lines
+    tail_lines=$(tmux capture-pane -t "${TMUX_SESSION}:0.0" -p 2>/dev/null | grep -v '^[[:space:]]*$' | tail -10)
+    if echo "$tail_lines" | grep -qE 'esc to interrupt| tokens\)|\([0-9]+[ms]'; then
+        return 1   # busy: live spinner / streaming counter visible
+    fi
+    return 0       # idle
 }
 
 # Auto-reply on Telegram when agent is busy processing
