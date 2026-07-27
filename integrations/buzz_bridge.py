@@ -12,9 +12,14 @@ import re
 import signal
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+try:
+    from integrations.nostr_ephemeral import EphemeralPublisher
+except ModuleNotFoundError:
+    from nostr_ephemeral import EphemeralPublisher
 
 JOE_DM_CHANNEL = "09eec80f-1a32-41a6-bf46-399a79d87b67"
 OWNER_PUBKEY = "91ef77d63dd6668711ca0a76a0cae780f50b9d960dd800b131d3971ab494bdea"
@@ -53,6 +58,33 @@ ALLOWED_OUTBOUND_EXTENSIONS = {".gif", ".jpeg", ".jpg", ".pdf", ".png"}
 
 
 @dataclass(frozen=True)
+class SubscriptionRule:
+    channels: set[str]
+    kinds: set[int]
+    require_mention: bool
+
+
+def default_subscription_rules() -> tuple[SubscriptionRule, ...]:
+    return (
+        SubscriptionRule(
+            channels={JOE_DM_CHANNEL},
+            kinds={9, 46010, 40007},
+            require_mention=False,
+        ),
+        SubscriptionRule(
+            channels={"*"},
+            kinds={9, 46010, 40007},
+            require_mention=True,
+        ),
+        SubscriptionRule(
+            channels={"*"},
+            kinds={45001, 45003},
+            require_mention=True,
+        ),
+    )
+
+
+@dataclass(frozen=True)
 class Policy:
     owner_pubkey: str
     allowed_authors: set[str]
@@ -65,6 +97,9 @@ class Policy:
     max_batch_events: int = 50
     stall_alert_seconds: int = 600
     max_turn_seconds: int = 7200
+    subscription_rules: tuple[SubscriptionRule, ...] = field(
+        default_factory=default_subscription_rules
+    )
 
 
 def default_policy() -> Policy:
@@ -104,6 +139,25 @@ def load_policy(path: Path) -> Policy:
         or stall_alert_seconds >= max_turn_seconds
     ):
         raise ValueError("policy bounds are unsafe or inconsistent")
+    raw_rules = payload.get("subscription_rules")
+    if raw_rules is None:
+        subscription_rules = default_subscription_rules()
+    else:
+        subscription_rules = tuple(
+            SubscriptionRule(
+                channels={str(channel) for channel in rule.get("channels", [])},
+                kinds={int(kind) for kind in rule.get("kinds", [])},
+                require_mention=bool(rule.get("require_mention", True)),
+            )
+            for rule in raw_rules
+        )
+        if not subscription_rules or any(
+            not rule.channels
+            or not rule.kinds
+            or any(kind <= 0 or kind > 65535 for kind in rule.kinds)
+            for rule in subscription_rules
+        ):
+            raise ValueError("subscription rules must define channels and valid kinds")
     return Policy(
         owner_pubkey=owner,
         allowed_authors=allowed,
@@ -119,6 +173,7 @@ def load_policy(path: Path) -> Policy:
         max_batch_events=max_batch_events,
         stall_alert_seconds=stall_alert_seconds,
         max_turn_seconds=max_turn_seconds,
+        subscription_rules=subscription_rules,
     )
 
 
@@ -144,20 +199,75 @@ def accepts_event(
     author = str(event.get("pubkey") or "")
     if author not in policy.allowed_authors:
         return False
-    if channel_id == policy.joe_dm_channel:
-        return author == policy.owner_pubkey
-    return any(
+    if channel_id == policy.joe_dm_channel and author != policy.owner_pubkey:
+        return False
+    return matches_subscription(event, channel_id, policy.subscription_rules)
+
+
+def matches_subscription(
+    event: dict[str, Any],
+    channel_id: str,
+    rules: tuple[SubscriptionRule, ...],
+) -> bool:
+    try:
+        kind = int(event["kind"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    mentioned = any(
         isinstance(tag, list)
         and len(tag) >= 2
         and tag[0] == "p"
         and tag[1] == STEVE_PUBKEY
         for tag in event.get("tags", [])
     )
+    for rule in rules:
+        if "*" not in rule.channels and channel_id not in rule.channels:
+            continue
+        if kind not in rule.kinds:
+            continue
+        if rule.require_mention and not mentioned:
+            continue
+        return True
+    return False
+
+
+def subscription_kinds(
+    channel_id: str,
+    rules: tuple[SubscriptionRule, ...],
+) -> list[int]:
+    return sorted(
+        {
+            kind
+            for rule in rules
+            if "*" in rule.channels or channel_id in rule.channels
+            for kind in rule.kinds
+        }
+    )
+
+
+def thread_references(event: dict[str, Any]) -> dict[str, str | None]:
+    root = None
+    for tag in event.get("tags", []):
+        if (
+            isinstance(tag, list)
+            and len(tag) >= 4
+            and tag[0] == "e"
+            and re.fullmatch(r"[0-9a-f]{64}", str(tag[1]))
+            and tag[3] == "root"
+        ):
+            root = str(tag[1])
+            break
+    parent = str(event.get("id") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", parent):
+        parent = None
+    return {"root_event_id": root, "parent_event_id": parent}
 
 
 def owner_control(event: dict[str, Any], policy: Policy | None = None) -> str | None:
     policy = policy or default_policy()
     if str(event.get("pubkey") or "") != policy.owner_pubkey:
+        return None
+    if int(event.get("kind") or 0) != 9:
         return None
     if str(event.get("channel_id") or "") != policy.joe_dm_channel and not any(
         isinstance(tag, list)
@@ -323,6 +433,8 @@ def health_snapshot(
     oldest_pending_age: int = 0,
     active_channel: str = "",
     active_turn_age: int = 0,
+    typing_ok: bool = True,
+    last_typing_error: str = "",
     last_delivery_at: int = 0,
     last_error: str = "",
     now: int | None = None,
@@ -349,6 +461,8 @@ def health_snapshot(
         "oldest_pending_age": oldest_pending_age,
         "active_channel": active_channel,
         "active_turn_age": active_turn_age,
+        "typing_ok": typing_ok,
+        "last_typing_error": last_typing_error,
         "last_delivery_at": last_delivery_at,
         "last_error": last_error,
     }
@@ -395,6 +509,7 @@ def parse_buzz_messages(raw: str, self_pubkey: str, since: int) -> list[dict[str
                 "created_at": created_at,
                 "channel_id": str(item.get("channel_id") or item.get("channel") or ""),
                 "content": str(item.get("content") or item.get("text") or ""),
+                "kind": int(item.get("kind") or 0),
             }
         )
     return sorted(messages, key=lambda item: (item["created_at"], item["id"]))
@@ -720,6 +835,11 @@ class BridgeState:
         self.data["last_error"] = error[:500]
         self.save()
 
+    def clear_error(self) -> None:
+        if self.data.get("last_error"):
+            self.data["last_error"] = ""
+            self.save()
+
     def profile_name(self, pubkey: str, lookup: Any) -> str:
         cached = self.data["profiles"].get(pubkey)
         if cached:
@@ -755,6 +875,12 @@ class BuzzBridge:
         self.policy = load_policy(policy_path) if policy_path else default_policy()
         self.last_presence = ""
         self.last_presence_at = 0
+        self.typing_publisher = EphemeralPublisher(
+            "https://buzz.neustac.com",
+            self.private_key,
+        )
+        self.last_typing_at = 0
+        self.last_typing_error = ""
 
     def buzz(self, *arguments: str, stdin: str | None = None) -> str:
         environment = {
@@ -804,6 +930,34 @@ class BuzzBridge:
                 names[pubkey] = self.state.profile_name(pubkey, self.lookup_profile)
         return render_context(payload, event_id, names)
 
+    def conversation_context(self, event: dict[str, Any]) -> str:
+        channel_id = str(event["channel_id"])
+        event_id = str(event["id"])
+        if channel_id == self.policy.joe_dm_channel:
+            return self.recent_context(channel_id, event_id)
+        references = thread_references(event)
+        root = references["root_event_id"] or event_id
+        payload = json.loads(
+            self.buzz(
+                "messages",
+                "thread",
+                "--channel",
+                channel_id,
+                "--event",
+                root,
+                "--limit",
+                "20",
+                "--depth-limit",
+                "20",
+            )
+        )
+        names = {}
+        for item in payload:
+            pubkey = str(item.get("pubkey") or "")
+            if pubkey:
+                names[pubkey] = self.state.profile_name(pubkey, self.lookup_profile)
+        return render_context(payload, event_id, names, limit=20)
+
     def download_attachments(self, event: dict[str, Any]) -> list[str]:
         downloaded = []
         event_dir = self.config_dir / "attachments" / event["id"]
@@ -841,7 +995,7 @@ class BuzzBridge:
             else f"buzz-batch-{event['id']}"
         )
         display_name = self.state.profile_name(event["pubkey"], self.lookup_profile)
-        context = self.recent_context(event["channel_id"], event["id"])
+        context = self.conversation_context(event)
         attachments = [
             path
             for item in events
@@ -867,11 +1021,14 @@ class BuzzBridge:
             self.state.mark_event(item["id"], item["created_at"])
             self.state.data["inbound_failures"].pop(str(item["id"]), None)
         now = int(time.time())
+        references = thread_references(event)
         active = self.state.data.get("active_turn")
         if steering and active:
             active["crm_ids"] = [*active.get("crm_ids", []), crm_id]
             active["events"] = [*active.get("events", []), *events]
             active["steering"] = True
+            active["channel_id"] = event["channel_id"]
+            active.update(references)
         else:
             self.state.data["active_turn"] = {
                 "channel_id": event["channel_id"],
@@ -883,6 +1040,7 @@ class BuzzBridge:
                 "stall_alerted": False,
                 "steering": steering,
                 "supersede": supersede,
+                **references,
             }
         self.state.record_delivery()
         self.state.save()
@@ -1187,6 +1345,8 @@ class BuzzBridge:
             active_turn_age=(
                 max(0, now - int(active.get("started_at", now))) if active else 0
             ),
+            typing_ok=not bool(self.last_typing_error),
+            last_typing_error=self.last_typing_error,
             last_delivery_at=int(self.state.data.get("last_delivery_at", 0)),
             last_error=str(self.state.data.get("last_error", "")),
             now=now,
@@ -1206,11 +1366,35 @@ class BuzzBridge:
             self.last_presence = desired
             self.last_presence_at = now
 
+    def refresh_typing(self, now: int | None = None) -> None:
+        active = self.state.data.get("active_turn") or {}
+        if not active or not self.agent_busy():
+            return
+        current = now or int(time.time())
+        if current - self.last_typing_at < 3:
+            return
+        try:
+            self.typing_publisher.publish_typing(
+                str(active["channel_id"]),
+                active.get("root_event_id"),
+                active.get("parent_event_id"),
+            )
+            self.last_typing_at = current
+            self.last_typing_error = ""
+        except Exception as error:
+            self.last_typing_error = str(error)[:500]
+
     def poll(self) -> None:
         self.forward_replies()
         channels = self.member_channels()
         for channel_id in channels:
             cursor = self.state.cursor_for(channel_id)
+            kinds = subscription_kinds(
+                channel_id,
+                self.policy.subscription_rules,
+            )
+            if not kinds:
+                continue
             raw = self.buzz(
                 "messages",
                 "get",
@@ -1220,6 +1404,8 @@ class BuzzBridge:
                 str(cursor),
                 "--limit",
                 "100",
+                "--kinds",
+                ",".join(str(kind) for kind in kinds),
             )
             for event in parse_buzz_messages(raw, self.public_key, cursor):
                 if not event["channel_id"]:
@@ -1246,6 +1432,8 @@ class BuzzBridge:
                     self.quarantine_inbound([item])
         self.dispatch_pending()
         self.monitor_turn()
+        self.refresh_typing()
+        self.state.clear_error()
         self.refresh_presence(self.write_health(relay_ok=True))
 
 
@@ -1303,6 +1491,7 @@ def main() -> None:
                 return
             time.sleep(arguments.interval)
     finally:
+        bridge.typing_publisher.close()
         try:
             bridge.buzz("users", "set-presence", "--status", "offline")
         except subprocess.CalledProcessError:

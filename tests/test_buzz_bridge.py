@@ -17,6 +17,7 @@ from integrations.buzz_bridge import (
     JOE_DM_CHANNEL,
     OWNER_PUBKEY,
     Policy,
+    SubscriptionRule,
     STEVE_PUBKEY,
     accepts_event,
     attachment_specs,
@@ -34,6 +35,8 @@ from integrations.buzz_bridge import (
     safe_attachment_path,
     send_proactive,
     stable_pane_digest,
+    thread_references,
+    matches_subscription,
     validate_outbound_file,
 )
 
@@ -138,6 +141,7 @@ class BuzzBridgeTest(unittest.TestCase):
         cancel = {
             "id": "cancel",
             "pubkey": OWNER_PUBKEY,
+            "kind": 9,
             "content": "!cancel",
             "channel_id": "channel-1",
             "tags": [["p", STEVE_PUBKEY]],
@@ -322,13 +326,14 @@ class BuzzBridgeTest(unittest.TestCase):
             send_proactive(lambda *args, **kwargs: "", "   ")
 
     def test_owner_dm_does_not_require_mention(self):
-        event = {"pubkey": OWNER_PUBKEY, "tags": [], "content": "Morning"}
+        event = {"pubkey": OWNER_PUBKEY, "kind": 9, "tags": [], "content": "Morning"}
         self.assertTrue(accepts_event(event, JOE_DM_CHANNEL))
 
     def test_channel_requires_allowed_author_and_steve_mention(self):
         allowed_agent = next(pubkey for pubkey in ALLOWED_AUTHORS if pubkey != OWNER_PUBKEY)
         tagged = {
             "pubkey": allowed_agent,
+            "kind": 9,
             "tags": [["p", STEVE_PUBKEY]],
             "content": "Please review",
         }
@@ -351,6 +356,40 @@ class BuzzBridgeTest(unittest.TestCase):
                 "-",
             ),
         )
+
+    def test_thread_references_prefer_marked_root_and_current_parent(self):
+        event = {
+            "id": "c" * 64,
+            "tags": [
+                ["e", "a" * 64, "", "root"],
+                ["e", "b" * 64, "", "reply"],
+            ],
+        }
+
+        self.assertEqual(
+            thread_references(event),
+            {"root_event_id": "a" * 64, "parent_event_id": "c" * 64},
+        )
+
+    def test_subscription_rules_fail_closed_by_kind_and_channel(self):
+        rules = (
+            SubscriptionRule(
+                channels={"channel-1"},
+                kinds={9, 45001},
+                require_mention=True,
+            ),
+        )
+        event = {
+            "kind": 9,
+            "tags": [["p", STEVE_PUBKEY]],
+        }
+
+        self.assertTrue(matches_subscription(event, "channel-1", rules))
+        self.assertFalse(
+            matches_subscription({**event, "kind": 99999}, "channel-1", rules)
+        )
+        self.assertFalse(matches_subscription(event, "channel-2", rules))
+        self.assertFalse(matches_subscription({**event, "tags": []}, "channel-1", rules))
         self.assertEqual(
             build_reply_arguments("channel-1", "event-1"),
             (
@@ -418,6 +457,45 @@ class BuzzBridgeTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "policy bounds"):
                 load_policy(path)
+
+    def test_policy_loads_explicit_forum_subscription(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "policy.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "owner_pubkey": OWNER_PUBKEY,
+                        "allowed_authors": [OWNER_PUBKEY],
+                        "joe_dm_channel": JOE_DM_CHANNEL,
+                        "allowed_upload_roots": [temporary],
+                        "subscription_rules": [
+                            {
+                                "channels": ["forum-channel"],
+                                "kinds": [45001, 45003],
+                                "require_mention": False,
+                            }
+                        ],
+                    }
+                )
+            )
+            os.chmod(path, 0o600)
+
+            policy = load_policy(path)
+
+            self.assertTrue(
+                matches_subscription(
+                    {"kind": 45001, "tags": []},
+                    "forum-channel",
+                    policy.subscription_rules,
+                )
+            )
+            self.assertFalse(
+                matches_subscription(
+                    {"kind": 9, "tags": []},
+                    "forum-channel",
+                    policy.subscription_rules,
+                )
+            )
 
     def test_attachment_tag_parsing_and_safe_path(self):
         event = {
@@ -526,6 +604,51 @@ class BuzzBridgeTest(unittest.TestCase):
                 bridge.recent_context(JOE_DM_CHANNEL, "current"), "JLUCKY: Earlier"
             )
 
+    def test_channel_context_reads_only_the_triggering_thread(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self.make_bridge(temporary)
+            root = "a" * 64
+            current = "c" * 64
+            bridge.lookup_profile = Mock(return_value="JLUCKY")
+            bridge.buzz = Mock(
+                return_value=json.dumps(
+                    [
+                        {
+                            "id": root,
+                            "pubkey": OWNER_PUBKEY,
+                            "content": "Root",
+                        },
+                        {
+                            "id": current,
+                            "pubkey": OWNER_PUBKEY,
+                            "content": "Current",
+                        },
+                    ]
+                )
+            )
+
+            context = bridge.conversation_context(
+                {
+                    "id": current,
+                    "channel_id": "channel-1",
+                    "tags": [["e", root, "", "root"]],
+                }
+            )
+
+            self.assertEqual(context, "JLUCKY: Root")
+            bridge.buzz.assert_called_once_with(
+                "messages",
+                "thread",
+                "--channel",
+                "channel-1",
+                "--event",
+                root,
+                "--limit",
+                "20",
+                "--depth-limit",
+                "20",
+            )
+
     def test_bridge_injects_event_atomically_with_route(self):
         with tempfile.TemporaryDirectory() as temporary:
             bridge = self.make_bridge(temporary)
@@ -584,6 +707,7 @@ class BuzzBridgeTest(unittest.TestCase):
             cancel = {
                 "id": "cancel",
                 "pubkey": OWNER_PUBKEY,
+                "kind": 9,
                 "content": "!cancel",
                 "created_at": 10,
                 "channel_id": JOE_DM_CHANNEL,
@@ -606,6 +730,7 @@ class BuzzBridgeTest(unittest.TestCase):
             event = {
                 "id": "replace",
                 "pubkey": OWNER_PUBKEY,
+                "kind": 9,
                 "content": "!replace use the second file",
                 "created_at": 12,
                 "channel_id": JOE_DM_CHANNEL,
@@ -752,6 +877,28 @@ class BuzzBridgeTest(unittest.TestCase):
         self.assertEqual(stable_pane_digest(first), stable_pane_digest(later))
         self.assertNotEqual(stable_pane_digest(first), stable_pane_digest(progress))
 
+    def test_typing_refresh_uses_active_thread_and_throttles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self.make_bridge(temporary)
+            bridge.typing_publisher = Mock()
+            bridge.agent_busy = Mock(return_value=True)
+            bridge.state.data["active_turn"] = {
+                "channel_id": "channel-1",
+                "root_event_id": "a" * 64,
+                "parent_event_id": "b" * 64,
+            }
+
+            bridge.refresh_typing(now=100)
+            bridge.refresh_typing(now=101)
+            bridge.refresh_typing(now=103)
+
+            self.assertEqual(bridge.typing_publisher.publish_typing.call_count, 2)
+            bridge.typing_publisher.publish_typing.assert_called_with(
+                "channel-1",
+                "a" * 64,
+                "b" * 64,
+            )
+
     def test_download_attachment_and_reject_oversize_result(self):
         with tempfile.TemporaryDirectory() as temporary:
             bridge = self.make_bridge(temporary)
@@ -826,6 +973,7 @@ class BuzzBridgeTest(unittest.TestCase):
                 {
                     "id": "allowed",
                     "pubkey": OWNER_PUBKEY,
+                    "kind": 9,
                     "content": "yes",
                     "created_at": 10,
                     "channel_id": JOE_DM_CHANNEL,
@@ -834,6 +982,7 @@ class BuzzBridgeTest(unittest.TestCase):
                 {
                     "id": "denied",
                     "pubkey": "f" * 64,
+                    "kind": 9,
                     "content": "no",
                     "created_at": 11,
                     "channel_id": JOE_DM_CHANNEL,
@@ -852,6 +1001,7 @@ class BuzzBridgeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             bridge = self.make_bridge(temporary)
             bridge.state.data["since"] = 7
+            bridge.state.data["last_error"] = "stale failure"
             bridge.member_channels = Mock(return_value=["channel-1", "channel-2"])
             bridge.forward_replies = Mock()
             bridge.write_health = Mock(return_value={
@@ -871,6 +1021,7 @@ class BuzzBridgeTest(unittest.TestCase):
                 for call in bridge.buzz.call_args_list
             ]
             self.assertEqual(since_values, ["7", "7"])
+            self.assertEqual(bridge.state.data["last_error"], "")
 
     def test_read_only_buzz_commands_are_validated(self):
         self.assertEqual(

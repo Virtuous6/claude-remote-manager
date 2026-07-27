@@ -82,6 +82,12 @@ order, keeps independent recovery cursors per channel, bounds pending queues,
 retries transient inbound failures, quarantines poison events, and alerts Joe
 through Telegram on dead letters or stalled turns.
 
+While you are actively handling a Buzz turn, the bridge publishes native Buzz
+typing indicators every three seconds. Channel context comes from the triggering
+thread only; replies remain attached to its root. Inbound subscriptions fail
+closed: DMs accept supported message kinds from Joe, channels require a tag, and
+tagged forum posts/comments are allowed while votes and unknown kinds are not.
+
 **Read-only Buzz context:**
 ```bash
 bash ../../core/bus/read-buzz.sh search "<query>" [--limit N]
