@@ -19,12 +19,15 @@ from integrations.buzz_bridge import (
     STEVE_PUBKEY,
     accepts_event,
     attachment_specs,
+    batch_events_by_channel,
     build_reply_arguments,
     crm_message,
+    crm_message_batch,
     health_snapshot,
     load_policy,
     parse_buzz_messages,
     presence_for_health,
+    owner_control,
     render_context,
     safe_attachment_path,
     send_proactive,
@@ -127,6 +130,57 @@ class BuzzBridgeTest(unittest.TestCase):
         self.assertIn("from JLUCKY", message["text"])
         self.assertIn("Recent context", message["text"])
         self.assertIn("/safe/inbox/report.pdf", message["text"])
+
+    def test_owner_controls_are_owner_only_and_not_forwarded(self):
+        cancel = {
+            "id": "cancel",
+            "pubkey": OWNER_PUBKEY,
+            "content": "!cancel",
+            "channel_id": "channel-1",
+            "tags": [["p", STEVE_PUBKEY]],
+        }
+        rotate = {**cancel, "id": "rotate", "content": "!rotate"}
+        stranger = {**cancel, "pubkey": "f" * 64}
+
+        self.assertEqual(owner_control(cancel), "cancel")
+        self.assertEqual(owner_control(rotate), "rotate")
+        self.assertIsNone(owner_control(stranger))
+        self.assertIsNone(owner_control({**cancel, "content": "!shutdown"}))
+
+    def test_events_batch_per_channel_in_timestamp_order(self):
+        events = [
+            {"id": "b", "channel_id": "two", "created_at": 3},
+            {"id": "c", "channel_id": "one", "created_at": 2},
+            {"id": "a", "channel_id": "one", "created_at": 1},
+        ]
+
+        batches = batch_events_by_channel(events)
+
+        self.assertEqual([[event["id"] for event in batch] for batch in batches], [["a", "c"], ["b"]])
+
+    def test_batch_message_routes_reply_to_latest_event(self):
+        events = [
+            {
+                "id": "one",
+                "pubkey": OWNER_PUBKEY,
+                "content": "first",
+                "created_at": 10,
+                "channel_id": JOE_DM_CHANNEL,
+            },
+            {
+                "id": "two",
+                "pubkey": OWNER_PUBKEY,
+                "content": "second",
+                "created_at": 11,
+                "channel_id": JOE_DM_CHANNEL,
+            },
+        ]
+
+        message = crm_message_batch(events, "buzz-batch-two", "JLUCKY")
+
+        self.assertIn("first", message["text"])
+        self.assertIn("second", message["text"])
+        self.assertIn("[event:two]", message["text"])
 
     def test_state_round_trip_and_event_dedup(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -308,11 +362,16 @@ class BuzzBridgeTest(unittest.TestCase):
             inbound_queue=2,
             outbound_queue=1,
             dead_letters=0,
+            oldest_inbound_age=12,
+            last_delivery_at=90,
+            last_error="",
             now=100,
         )
         self.assertEqual(health["status"], "degraded")
         self.assertEqual(presence_for_health(health), "away")
         self.assertEqual(presence_for_health({**health, "relay_ok": False}), "offline")
+        self.assertEqual(health["oldest_inbound_age"], 12)
+        self.assertEqual(health["last_delivery_at"], 90)
 
     def test_profile_cache_avoids_repeat_lookup(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -404,9 +463,35 @@ class BuzzBridgeTest(unittest.TestCase):
             second.write_text(json.dumps({"reply_to": "crm-1", "text": "fail"}))
             error = subprocess.CalledProcessError(3, ["buzz"], stderr="denied")
             bridge.buzz = Mock(side_effect=error)
+            bridge.alert_dead_letter = Mock()
             bridge.forward_replies()
             bridge.forward_replies()
             self.assertTrue((bridge.crm_root / "dead-letter/buzz/second.json").exists())
+            bridge.alert_dead_letter.assert_called_once()
+
+    def test_owner_cancel_and_rotate_actions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self.make_bridge(temporary)
+            bridge.cancel_current_turn = Mock()
+            bridge.rotate_session = Mock()
+            bridge.send_control_confirmation = Mock()
+
+            cancel = {
+                "id": "cancel",
+                "pubkey": OWNER_PUBKEY,
+                "content": "!cancel",
+                "created_at": 10,
+                "channel_id": JOE_DM_CHANNEL,
+                "tags": [],
+            }
+            rotate = {**cancel, "id": "rotate", "content": "!rotate", "created_at": 11}
+
+            self.assertTrue(bridge.handle_control(cancel))
+            self.assertTrue(bridge.handle_control(rotate))
+            bridge.cancel_current_turn.assert_called_once()
+            bridge.rotate_session.assert_called_once()
+            self.assertTrue(bridge.state.seen_event("cancel"))
+            self.assertTrue(bridge.state.seen_event("rotate"))
 
     def test_download_attachment_and_reject_oversize_result(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -501,6 +586,28 @@ class BuzzBridgeTest(unittest.TestCase):
 
             bridge.inject_event.assert_called_once()
             self.assertTrue(bridge.state.seen_event("denied"))
+
+    def test_poll_uses_one_recovery_cursor_across_channels(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self.make_bridge(temporary)
+            bridge.state.data["since"] = 7
+            bridge.member_channels = Mock(return_value=["channel-1", "channel-2"])
+            bridge.forward_replies = Mock()
+            bridge.write_health = Mock(return_value={
+                "relay_ok": True,
+                "tmux_ok": True,
+                "claude_ok": True,
+            })
+            bridge.refresh_presence = Mock()
+            bridge.buzz = Mock(return_value="[]")
+
+            bridge.poll()
+
+            since_values = [
+                call.args[call.args.index("--since") + 1]
+                for call in bridge.buzz.call_args_list
+            ]
+            self.assertEqual(since_values, ["7", "7"])
 
 
 if __name__ == "__main__":

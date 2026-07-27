@@ -130,6 +130,34 @@ def accepts_event(
     )
 
 
+def owner_control(event: dict[str, Any], policy: Policy | None = None) -> str | None:
+    policy = policy or default_policy()
+    if str(event.get("pubkey") or "") != policy.owner_pubkey:
+        return None
+    if str(event.get("channel_id") or "") != policy.joe_dm_channel and not any(
+        isinstance(tag, list)
+        and len(tag) >= 2
+        and tag[0] == "p"
+        and tag[1] == STEVE_PUBKEY
+        for tag in event.get("tags", [])
+    ):
+        return None
+    command = str(event.get("content") or "").strip().lower()
+    return command[1:] if command in {"!cancel", "!rotate"} else None
+
+
+def batch_events_by_channel(
+    events: list[dict[str, Any]],
+) -> list[list[dict[str, Any]]]:
+    channels: dict[str, list[dict[str, Any]]] = {}
+    for event in sorted(events, key=lambda item: (item["created_at"], item["id"])):
+        channels.setdefault(event["channel_id"], []).append(event)
+    return sorted(
+        channels.values(),
+        key=lambda batch: (batch[0]["created_at"], batch[0]["id"]),
+    )
+
+
 def build_reply_arguments(channel_id: str, event_id: str) -> tuple[str, ...]:
     arguments = ["messages", "send", "--channel", channel_id]
     if channel_id != JOE_DM_CHANNEL:
@@ -224,6 +252,9 @@ def health_snapshot(
     inbound_queue: int,
     outbound_queue: int,
     dead_letters: int,
+    oldest_inbound_age: int = 0,
+    last_delivery_at: int = 0,
+    last_error: str = "",
     now: int | None = None,
 ) -> dict[str, Any]:
     healthy = relay_ok and tmux_ok and claude_ok and dead_letters == 0
@@ -236,6 +267,9 @@ def health_snapshot(
         "inbound_queue": inbound_queue,
         "outbound_queue": outbound_queue,
         "dead_letters": dead_letters,
+        "oldest_inbound_age": oldest_inbound_age,
+        "last_delivery_at": last_delivery_at,
+        "last_error": last_error,
     }
 
 
@@ -305,6 +339,31 @@ def crm_message(
     }
 
 
+def crm_message_batch(
+    events: list[dict[str, Any]],
+    crm_id: str,
+    display_name: str,
+    context: str = "",
+    attachments: list[str] | None = None,
+) -> dict[str, Any]:
+    if not events:
+        raise ValueError("event batch cannot be empty")
+    latest = events[-1]
+    if len(events) == 1:
+        return crm_message(latest, crm_id, display_name, context, attachments)
+    content = "\n\n".join(
+        f"[{index + 1}/{len(events)}] {event['content']}"
+        for index, event in enumerate(events)
+    )
+    return crm_message(
+        {**latest, "content": content},
+        crm_id,
+        display_name,
+        context,
+        attachments,
+    )
+
+
 class BridgeState:
     def __init__(self, path: Path):
         self.path = path
@@ -314,6 +373,8 @@ class BridgeState:
             "outbound_failures": {},
             "profiles": {},
             "reply_routes": {},
+            "last_delivery_at": 0,
+            "last_error": "",
         }
         if path.exists():
             self.data.update(json.loads(path.read_text()))
@@ -356,6 +417,15 @@ class BridgeState:
         self.data["outbound_failures"].pop(filename, None)
         self.save()
 
+    def record_delivery(self) -> None:
+        self.data["last_delivery_at"] = int(time.time())
+        self.data["last_error"] = ""
+        self.save()
+
+    def record_error(self, error: str) -> None:
+        self.data["last_error"] = error[:500]
+        self.save()
+
     def profile_name(self, pubkey: str, lookup: Any) -> str:
         cached = self.data["profiles"].get(pubkey)
         if cached:
@@ -385,6 +455,7 @@ class BuzzBridge:
         self.private_key = identity["private_key"]
         self.public_key = identity["public_key"]
         self.crm_root = crm_root
+        self.template_root = Path(__file__).resolve().parent.parent
         self.state = BridgeState(state_path)
         self.config_dir = state_path.parent
         self.policy = load_policy(policy_path) if policy_path else default_policy()
@@ -455,16 +526,31 @@ class BuzzBridge:
         return downloaded
 
     def inject_event(self, event: dict[str, Any]) -> None:
+        self.inject_events([event])
+
+    def inject_events(self, events: list[dict[str, Any]]) -> None:
+        events = [event for event in events if not self.state.seen_event(event["id"])]
+        if not events:
+            return
+        event = events[-1]
         if self.state.seen_event(event["id"]):
             return
-        crm_id = f"buzz-{event['id']}"
+        crm_id = (
+            f"buzz-{event['id']}"
+            if len(events) == 1
+            else f"buzz-batch-{event['id']}"
+        )
         display_name = self.state.profile_name(event["pubkey"], self.lookup_profile)
         context = self.recent_context(event["channel_id"], event["id"])
-        attachments = self.download_attachments(event)
-        message = crm_message(
-            event,
+        attachments = [
+            path
+            for item in events
+            for path in self.download_attachments(item)
+        ]
+        message = crm_message_batch(
+            events,
             crm_id,
-            display_name=display_name,
+            display_name,
             context=context,
             attachments=attachments,
         )
@@ -475,8 +561,64 @@ class BuzzBridge:
         temporary.write_text(json.dumps(message) + "\n")
         temporary.replace(final)
         self.state.map_crm_reply(crm_id, event["channel_id"], event["id"])
+        for item in events:
+            self.state.mark_event(item["id"], item["created_at"])
+        self.state.record_delivery()
+        self.state.save()
+
+    def cancel_current_turn(self) -> None:
+        subprocess.run(
+            ["tmux", "send-keys", "-t", "crm-default-steve-kingsley:0", "C-c"],
+            check=True,
+            capture_output=True,
+        )
+
+    def rotate_session(self) -> None:
+        subprocess.run(
+            [
+                "bash",
+                str(self.template_root / "core/bus/hard-restart.sh"),
+                "--reason",
+                "Buzz owner requested context rotation",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+    def send_control_confirmation(self, event: dict[str, Any], content: str) -> None:
+        self.buzz(
+            *build_reply_arguments(event["channel_id"], event["id"]),
+            stdin=content,
+        )
+
+    def handle_control(self, event: dict[str, Any]) -> bool:
+        command = owner_control(event, self.policy)
+        if command is None:
+            return False
+        if command == "cancel":
+            self.cancel_current_turn()
+            confirmation = "Cancelled Steve's current turn."
+        else:
+            self.send_control_confirmation(event, "Rotating Steve's session context.")
+            self.rotate_session()
+            confirmation = ""
+        if confirmation:
+            self.send_control_confirmation(event, confirmation)
         self.state.mark_event(event["id"], event["created_at"])
         self.state.save()
+        return True
+
+    def alert_dead_letter(self, filename: str, detail: str) -> None:
+        subprocess.run(
+            [
+                "bash",
+                str(self.template_root / "core/bus/send-telegram.sh"),
+                "1242084718",
+                f"Buzz delivery failed permanently: {filename}: {detail[:300]}",
+            ],
+            check=False,
+            capture_output=True,
+        )
 
     def forward_replies(self) -> None:
         inbox = self.crm_root / "inbox" / "buzz"
@@ -499,8 +641,10 @@ class BuzzBridge:
                     path.name, detail, self.policy.max_outbound_attempts
                 ):
                     path.replace(dead_letters / path.name)
+                    self.alert_dead_letter(path.name, detail)
                 continue
             self.state.clear_outbound_failure(path.name)
+            self.state.record_delivery()
             path.replace(processed / path.name)
 
     def tmux_health(self) -> tuple[bool, bool]:
@@ -522,13 +666,24 @@ class BuzzBridge:
 
     def write_health(self, relay_ok: bool) -> dict[str, Any]:
         tmux_ok, claude_ok = self.tmux_health()
+        inbound_files = list((self.crm_root / "inbox/steve-kingsley").glob("*.json"))
+        now = int(time.time())
+        oldest_inbound_age = (
+            max(0, now - int(min(path.stat().st_mtime for path in inbound_files)))
+            if inbound_files
+            else 0
+        )
         health = health_snapshot(
             relay_ok=relay_ok,
             tmux_ok=tmux_ok,
             claude_ok=claude_ok,
-            inbound_queue=len(list((self.crm_root / "inbox/steve-kingsley").glob("*.json"))),
+            inbound_queue=len(inbound_files),
             outbound_queue=len(list((self.crm_root / "inbox/buzz").glob("*.json"))),
             dead_letters=len(list((self.crm_root / "dead-letter/buzz").glob("*.json"))),
+            oldest_inbound_age=oldest_inbound_age,
+            last_delivery_at=int(self.state.data.get("last_delivery_at", 0)),
+            last_error=str(self.state.data.get("last_error", "")),
+            now=now,
         )
         path = self.config_dir / "health.json"
         temporary = path.with_suffix(".tmp")
@@ -548,6 +703,8 @@ class BuzzBridge:
     def poll(self) -> None:
         self.forward_replies()
         channels = self.member_channels()
+        cursor = self.state.since
+        accepted: list[dict[str, Any]] = []
         for channel_id in channels:
             raw = self.buzz(
                 "messages",
@@ -555,18 +712,25 @@ class BuzzBridge:
                 "--channel",
                 channel_id,
                 "--since",
-                str(self.state.since),
+                str(cursor),
                 "--limit",
                 "100",
             )
             for event in parse_buzz_messages(raw, self.public_key, self.state.since):
                 if not event["channel_id"]:
                     event["channel_id"] = channel_id
+                if self.handle_control(event):
+                    continue
                 if not accepts_event(event, channel_id, self.policy):
                     self.state.mark_event(event["id"], event["created_at"])
                     self.state.save()
                     continue
-                self.inject_event(event)
+                accepted.append(event)
+        for batch in batch_events_by_channel(accepted):
+            if len(batch) == 1:
+                self.inject_event(batch[0])
+            else:
+                self.inject_events(batch)
         self.refresh_presence(self.write_health(relay_ok=True))
 
 
@@ -615,8 +779,9 @@ def main() -> None:
             try:
                 bridge.poll()
             except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as error:
-                bridge.write_health(relay_ok=False)
                 detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+                bridge.state.record_error(detail)
+                bridge.write_health(relay_ok=False)
                 print(f"buzz bridge poll failed: {detail[:500]}", flush=True)
             if arguments.once:
                 return
