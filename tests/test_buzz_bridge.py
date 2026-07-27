@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import Mock
 from unittest.mock import patch
 
+from integrations import read_buzz
 from integrations.buzz_bridge import (
     ALLOWED_AUTHORS,
     BridgeState,
@@ -28,9 +29,11 @@ from integrations.buzz_bridge import (
     parse_buzz_messages,
     presence_for_health,
     owner_control,
+    read_command,
     render_context,
     safe_attachment_path,
     send_proactive,
+    stable_pane_digest,
     validate_outbound_file,
 )
 
@@ -144,6 +147,10 @@ class BuzzBridgeTest(unittest.TestCase):
 
         self.assertEqual(owner_control(cancel), "cancel")
         self.assertEqual(owner_control(rotate), "rotate")
+        self.assertEqual(
+            owner_control({**cancel, "content": "!replace use the second file"}),
+            "replace",
+        )
         self.assertIsNone(owner_control(stranger))
         self.assertIsNone(owner_control({**cancel, "content": "!shutdown"}))
 
@@ -198,6 +205,84 @@ class BuzzBridgeTest(unittest.TestCase):
                 {"channel_id": "channel-1", "event_id": "event-1"},
             )
             self.assertEqual(restored.since, 41)
+
+    def test_state_tracks_independent_channel_cursors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = BridgeState(Path(temporary) / "state.json")
+            state.data["since"] = 5
+            state.data["startup_cursor"] = 5
+
+            state.mark_observed("one", "event-1", 20)
+
+            self.assertEqual(state.cursor_for("one"), 19)
+            self.assertEqual(state.cursor_for("two"), 5)
+
+    def test_pending_queue_is_bounded_and_fair(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = BridgeState(Path(temporary) / "state.json")
+            dropped = state.queue_event(
+                {"id": "a", "channel_id": "one", "created_at": 1, "pubkey": "x"},
+                max_pending=1,
+            )
+            self.assertIsNone(dropped)
+            dropped = state.queue_event(
+                {"id": "b", "channel_id": "one", "created_at": 3, "pubkey": "x"},
+                max_pending=1,
+            )
+            state.queue_event(
+                {"id": "c", "channel_id": "two", "created_at": 2, "pubkey": "x"},
+                max_pending=2,
+            )
+
+            self.assertEqual(dropped["id"], "a")
+            self.assertEqual(
+                state.take_next_batch(max_events=10, owner_pubkey=OWNER_PUBKEY)["channel_id"],
+                "two",
+            )
+
+    def test_busy_queue_only_dispatches_owner_steering(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = BridgeState(Path(temporary) / "state.json")
+            state.queue_event(
+                {"id": "agent", "channel_id": "one", "created_at": 1, "pubkey": "a"},
+                max_pending=10,
+            )
+            state.queue_event(
+                {
+                    "id": "owner",
+                    "channel_id": "two",
+                    "created_at": 2,
+                    "pubkey": OWNER_PUBKEY,
+                },
+                max_pending=10,
+            )
+
+            batch = state.take_next_batch(
+                max_events=10,
+                owner_pubkey=OWNER_PUBKEY,
+                owner_only=True,
+            )
+
+            self.assertEqual([event["id"] for event in batch["events"]], ["owner"])
+            self.assertEqual(state.pending_count(), 1)
+
+    def test_transient_inbound_failure_requeues_then_dead_letters(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = BridgeState(Path(temporary) / "state.json")
+            event = {
+                "id": "bad",
+                "channel_id": "one",
+                "created_at": 1,
+                "pubkey": OWNER_PUBKEY,
+            }
+
+            dead = state.record_inbound_failure([event], "relay down", 2, now=10)
+            self.assertEqual(dead, [])
+            self.assertEqual(state.pending_count(), 1)
+            dead = state.record_inbound_failure([event], "relay down", 2, now=20)
+
+            self.assertEqual([item["event"]["id"] for item in dead], ["bad"])
+            self.assertEqual(state.pending_count(), 0)
 
     def test_outbound_failures_reach_dead_letter_threshold(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -312,6 +397,26 @@ class BuzzBridgeTest(unittest.TestCase):
 
             os.chmod(path, 0o644)
             with self.assertRaisesRegex(PermissionError, "0600"):
+                load_policy(path)
+
+    def test_policy_rejects_unsafe_queue_and_timeout_bounds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "policy.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "owner_pubkey": OWNER_PUBKEY,
+                        "allowed_authors": [OWNER_PUBKEY],
+                        "joe_dm_channel": JOE_DM_CHANNEL,
+                        "allowed_upload_roots": [temporary],
+                        "max_batch_events": 0,
+                        "max_turn_seconds": 5,
+                    }
+                )
+            )
+            os.chmod(path, 0o600)
+
+            with self.assertRaisesRegex(ValueError, "policy bounds"):
                 load_policy(path)
 
     def test_attachment_tag_parsing_and_safe_path(self):
@@ -493,6 +598,160 @@ class BuzzBridgeTest(unittest.TestCase):
             self.assertTrue(bridge.state.seen_event("cancel"))
             self.assertTrue(bridge.state.seen_event("rotate"))
 
+    def test_owner_replace_cancels_and_queues_superseding_request(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self.make_bridge(temporary)
+            bridge.cancel_current_turn = Mock()
+            bridge.state.data["active_turn"] = {"events": []}
+            event = {
+                "id": "replace",
+                "pubkey": OWNER_PUBKEY,
+                "content": "!replace use the second file",
+                "created_at": 12,
+                "channel_id": JOE_DM_CHANNEL,
+                "tags": [],
+            }
+
+            self.assertTrue(bridge.handle_control(event))
+
+            bridge.cancel_current_turn.assert_called_once()
+            batch = bridge.state.take_next_batch(
+                max_events=10,
+                owner_pubkey=OWNER_PUBKEY,
+            )
+            self.assertEqual(batch["events"][0]["content"], "use the second file")
+            self.assertTrue(batch["events"][0]["_supersede"])
+
+    def test_dispatch_queues_agents_but_steers_owner_when_busy(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self.make_bridge(temporary)
+            bridge.agent_busy = Mock(return_value=True)
+            bridge.inject_events = Mock()
+            bridge.state.queue_event(
+                {
+                    "id": "agent",
+                    "channel_id": "one",
+                    "created_at": 1,
+                    "pubkey": "a",
+                },
+                max_pending=10,
+            )
+            bridge.state.queue_event(
+                {
+                    "id": "owner",
+                    "channel_id": "two",
+                    "created_at": 2,
+                    "pubkey": OWNER_PUBKEY,
+                },
+                max_pending=10,
+            )
+
+            bridge.dispatch_pending()
+
+            bridge.inject_events.assert_called_once()
+            self.assertEqual(bridge.inject_events.call_args.args[0][0]["id"], "owner")
+            self.assertTrue(bridge.inject_events.call_args.kwargs["steering"])
+            self.assertEqual(bridge.state.pending_count(), 1)
+
+    def test_permanent_inbound_failure_is_quarantined_and_alerted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self.make_bridge(temporary)
+            bridge.agent_busy = Mock(return_value=False)
+            bridge.alert_inbound_dead_letter = Mock()
+            bridge.inject_events = Mock(side_effect=ValueError("bad attachment"))
+            event = {
+                "id": "bad",
+                "channel_id": "one",
+                "created_at": 1,
+                "pubkey": OWNER_PUBKEY,
+            }
+            bridge.state.queue_event(event, max_pending=10)
+
+            bridge.dispatch_pending()
+
+            self.assertEqual(bridge.state.pending_count(), 0)
+            bridge.alert_inbound_dead_letter.assert_called_once()
+            self.assertTrue(
+                (bridge.crm_root / "dead-letter/buzz-inbound/bad.json").exists()
+            )
+
+    def test_stalled_turn_alerts_once_then_requeues_at_deadline(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self.make_bridge(temporary)
+            bridge.policy = Policy(
+                **{
+                    **bridge.policy.__dict__,
+                    "stall_alert_seconds": 10,
+                    "max_turn_seconds": 20,
+                }
+            )
+            event = {
+                "id": "work",
+                "channel_id": "one",
+                "created_at": 1,
+                "pubkey": OWNER_PUBKEY,
+            }
+            bridge.state.data["active_turn"] = {
+                "channel_id": "one",
+                "crm_ids": ["crm-work"],
+                "events": [event],
+                "started_at": 100,
+                "last_activity_at": 100,
+                "pane_hash": "same",
+                "stall_alerted": False,
+            }
+            bridge.agent_busy = Mock(return_value=True)
+            bridge.pane_digest = Mock(return_value="same")
+            bridge.alert_stalled_turn = Mock()
+            bridge.cancel_current_turn = Mock()
+
+            bridge.monitor_turn(now=111)
+            bridge.monitor_turn(now=112)
+            bridge.monitor_turn(now=121)
+
+            bridge.alert_stalled_turn.assert_called_once()
+            bridge.cancel_current_turn.assert_called_once()
+            self.assertEqual(bridge.state.pending_count(), 1)
+            self.assertIsNone(bridge.state.data["active_turn"])
+
+    def test_absolute_turn_deadline_applies_despite_progress(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            bridge = self.make_bridge(temporary)
+            bridge.policy = Policy(
+                **{**bridge.policy.__dict__, "max_turn_seconds": 20}
+            )
+            event = {
+                "id": "work",
+                "channel_id": "one",
+                "created_at": 1,
+                "pubkey": OWNER_PUBKEY,
+            }
+            bridge.state.data["active_turn"] = {
+                "channel_id": "one",
+                "crm_ids": ["crm-work"],
+                "events": [event],
+                "started_at": 100,
+                "last_activity_at": 119,
+                "pane_hash": "old",
+                "stall_alerted": False,
+            }
+            bridge.agent_busy = Mock(return_value=True)
+            bridge.pane_digest = Mock(return_value="new-progress")
+            bridge.cancel_current_turn = Mock()
+
+            bridge.monitor_turn(now=121)
+
+            bridge.cancel_current_turn.assert_called_once()
+            self.assertEqual(bridge.state.pending_count(), 1)
+
+    def test_pane_digest_ignores_spinner_time_but_tracks_real_output(self):
+        first = "Read file.py\n✶ Working… (10s · 2k tokens)\n❯\nbypass permissions on"
+        later = "Read file.py\n✻ Working… (11s · 2.1k tokens)\n❯\nbypass permissions on"
+        progress = "Read file.py\nWrote report.md\n✻ Working… (11s · 2.1k tokens)"
+
+        self.assertEqual(stable_pane_digest(first), stable_pane_digest(later))
+        self.assertNotEqual(stable_pane_digest(first), stable_pane_digest(progress))
+
     def test_download_attachment_and_reject_oversize_result(self):
         with tempfile.TemporaryDirectory() as temporary:
             bridge = self.make_bridge(temporary)
@@ -561,7 +820,8 @@ class BuzzBridgeTest(unittest.TestCase):
                 "claude_ok": True,
             })
             bridge.refresh_presence = Mock()
-            bridge.inject_event = Mock()
+            bridge.dispatch_pending = Mock()
+            bridge.monitor_turn = Mock()
             events = [
                 {
                     "id": "allowed",
@@ -584,7 +844,8 @@ class BuzzBridgeTest(unittest.TestCase):
 
             bridge.poll()
 
-            bridge.inject_event.assert_called_once()
+            bridge.dispatch_pending.assert_called_once()
+            self.assertEqual(bridge.state.pending_count(), 1)
             self.assertTrue(bridge.state.seen_event("denied"))
 
     def test_poll_uses_one_recovery_cursor_across_channels(self):
@@ -599,6 +860,8 @@ class BuzzBridgeTest(unittest.TestCase):
                 "claude_ok": True,
             })
             bridge.refresh_presence = Mock()
+            bridge.dispatch_pending = Mock()
+            bridge.monitor_turn = Mock()
             bridge.buzz = Mock(return_value="[]")
 
             bridge.poll()
@@ -608,6 +871,33 @@ class BuzzBridgeTest(unittest.TestCase):
                 for call in bridge.buzz.call_args_list
             ]
             self.assertEqual(since_values, ["7", "7"])
+
+    def test_read_only_buzz_commands_are_validated(self):
+        self.assertEqual(
+            read_command("search", query="launch", limit=5),
+            ("messages", "search", "--query", "launch", "--limit", "5"),
+        )
+        self.assertEqual(
+            read_command("feed", limit=10),
+            ("feed", "get", "--limit", "10"),
+        )
+        with self.assertRaisesRegex(ValueError, "channel"):
+            read_command("thread", channel="../bad", event="f" * 64)
+        with self.assertRaisesRegex(ValueError, "limit"):
+            read_command("search", query="x", limit=101)
+
+    def test_read_buzz_cli_uses_allowlisted_command(self):
+        fake_bridge = Mock()
+        fake_bridge.buzz.return_value = '[{"type":"mention"}]'
+        with (
+            patch.object(read_buzz, "BuzzBridge", return_value=fake_bridge),
+            patch("sys.argv", ["read_buzz", "feed", "--limit", "5"]),
+            patch("builtins.print") as output,
+        ):
+            read_buzz.main()
+
+        fake_bridge.buzz.assert_called_once_with("feed", "get", "--limit", "5")
+        output.assert_called_once_with('[{"type":"mention"}]')
 
 
 if __name__ == "__main__":
