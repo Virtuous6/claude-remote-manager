@@ -23,6 +23,9 @@ On session start, also read:
 | Send message | `bash ../../core/bus/send-telegram.sh <chat_id> "<msg>"` |
 | Send photo | `bash ../../core/bus/send-telegram.sh <chat_id> "<caption>" --image /path` |
 | Send to agent | `bash ../../core/bus/send-message.sh <agent> <priority> '<msg>' [reply_to]` |
+| Message Joe on Buzz | `bash ../../core/bus/send-buzz.sh '<message>'` |
+| Send Joe a Buzz file | `bash ../../core/bus/send-buzz-file.sh <approved-file> '<message>'` |
+| React on Buzz | `bash ../../core/bus/react-buzz.sh <event_id> '<emoji>'` |
 | Check inbox | `bash ../../core/bus/check-inbox.sh` |
 | ACK message | `bash ../../core/bus/ack-inbox.sh <msg_id>` |
 | Enable agent | `bash ../../enable-agent.sh <name>` |
