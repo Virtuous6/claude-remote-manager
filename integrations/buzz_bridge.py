@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import mimetypes
 import os
@@ -59,6 +60,11 @@ class Policy:
     allowed_upload_roots: tuple[Path, ...]
     max_attachment_bytes: int = 10 * 1024 * 1024
     max_outbound_attempts: int = 5
+    max_inbound_attempts: int = 5
+    max_pending_per_channel: int = 500
+    max_batch_events: int = 50
+    stall_alert_seconds: int = 600
+    max_turn_seconds: int = 7200
 
 
 def default_policy() -> Policy:
@@ -84,6 +90,20 @@ def load_policy(path: Path) -> Policy:
         raise ValueError("owner_pubkey must be 64 lowercase hex characters")
     if owner not in allowed or any(not re.fullmatch(r"[0-9a-f]{64}", key) for key in allowed):
         raise ValueError("allowed_authors must contain valid owner pubkey")
+    max_inbound_attempts = int(payload.get("max_inbound_attempts", 5))
+    max_pending_per_channel = int(payload.get("max_pending_per_channel", 500))
+    max_batch_events = int(payload.get("max_batch_events", 50))
+    stall_alert_seconds = int(payload.get("stall_alert_seconds", 600))
+    max_turn_seconds = int(payload.get("max_turn_seconds", 7200))
+    if (
+        not 1 <= max_inbound_attempts <= 20
+        or not 1 <= max_pending_per_channel <= 5000
+        or not 1 <= max_batch_events <= 100
+        or not 30 <= stall_alert_seconds <= 86400
+        or not 60 <= max_turn_seconds <= 604800
+        or stall_alert_seconds >= max_turn_seconds
+    ):
+        raise ValueError("policy bounds are unsafe or inconsistent")
     return Policy(
         owner_pubkey=owner,
         allowed_authors=allowed,
@@ -94,6 +114,11 @@ def load_policy(path: Path) -> Policy:
         ),
         max_attachment_bytes=int(payload.get("max_attachment_bytes", 10 * 1024 * 1024)),
         max_outbound_attempts=int(payload.get("max_outbound_attempts", 5)),
+        max_inbound_attempts=max_inbound_attempts,
+        max_pending_per_channel=max_pending_per_channel,
+        max_batch_events=max_batch_events,
+        stall_alert_seconds=stall_alert_seconds,
+        max_turn_seconds=max_turn_seconds,
     )
 
 
@@ -143,6 +168,8 @@ def owner_control(event: dict[str, Any], policy: Policy | None = None) -> str | 
     ):
         return None
     command = str(event.get("content") or "").strip().lower()
+    if command.startswith("!replace "):
+        return "replace"
     return command[1:] if command in {"!cancel", "!rotate"} else None
 
 
@@ -156,6 +183,44 @@ def batch_events_by_channel(
         channels.values(),
         key=lambda batch: (batch[0]["created_at"], batch[0]["id"]),
     )
+
+
+def read_command(
+    action: str,
+    *,
+    query: str = "",
+    channel: str = "",
+    event: str = "",
+    limit: int = 20,
+) -> tuple[str, ...]:
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+    if action == "search":
+        if not query.strip():
+            raise ValueError("search query cannot be empty")
+        return ("messages", "search", "--query", query.strip(), "--limit", str(limit))
+    if action == "feed":
+        return ("feed", "get", "--limit", str(limit))
+    if action == "channels":
+        return ("channels", "list", "--member")
+    if not re.fullmatch(r"[0-9a-f-]{36}", channel):
+        raise ValueError("channel must be a UUID")
+    if action == "members":
+        return ("channels", "members", "--channel", channel)
+    if action == "thread":
+        if not re.fullmatch(r"[0-9a-f]{64}", event):
+            raise ValueError("event must be 64 lowercase hex characters")
+        return (
+            "messages",
+            "thread",
+            "--channel",
+            channel,
+            "--event",
+            event,
+            "--limit",
+            str(limit),
+        )
+    raise ValueError("unsupported read action")
 
 
 def build_reply_arguments(channel_id: str, event_id: str) -> tuple[str, ...]:
@@ -252,12 +317,23 @@ def health_snapshot(
     inbound_queue: int,
     outbound_queue: int,
     dead_letters: int,
+    inbound_dead_letters: int = 0,
     oldest_inbound_age: int = 0,
+    bridge_pending: int = 0,
+    oldest_pending_age: int = 0,
+    active_channel: str = "",
+    active_turn_age: int = 0,
     last_delivery_at: int = 0,
     last_error: str = "",
     now: int | None = None,
 ) -> dict[str, Any]:
-    healthy = relay_ok and tmux_ok and claude_ok and dead_letters == 0
+    healthy = (
+        relay_ok
+        and tmux_ok
+        and claude_ok
+        and dead_letters == 0
+        and inbound_dead_letters == 0
+    )
     return {
         "checked_at": now or int(time.time()),
         "status": "healthy" if healthy else "degraded",
@@ -267,7 +343,12 @@ def health_snapshot(
         "inbound_queue": inbound_queue,
         "outbound_queue": outbound_queue,
         "dead_letters": dead_letters,
+        "inbound_dead_letters": inbound_dead_letters,
         "oldest_inbound_age": oldest_inbound_age,
+        "bridge_pending": bridge_pending,
+        "oldest_pending_age": oldest_pending_age,
+        "active_channel": active_channel,
+        "active_turn_age": active_turn_age,
         "last_delivery_at": last_delivery_at,
         "last_error": last_error,
     }
@@ -279,6 +360,20 @@ def presence_for_health(health: dict[str, Any]) -> str:
     if not health["tmux_ok"] or not health["claude_ok"]:
         return "away"
     return "online"
+
+
+def stable_pane_digest(pane: str) -> str:
+    stable_lines = []
+    for line in pane.splitlines():
+        if re.search(
+            r"esc to interrupt| tokens\)|\([0-9]+[ms]|bypass permissions on",
+            line,
+        ):
+            continue
+        if line.strip() in {"", "❯"}:
+            continue
+        stable_lines.append(line)
+    return hashlib.sha256("\n".join(stable_lines).encode()).hexdigest()
 
 
 def parse_buzz_messages(raw: str, self_pubkey: str, since: int) -> list[dict[str, Any]]:
@@ -345,16 +440,49 @@ def crm_message_batch(
     display_name: str,
     context: str = "",
     attachments: list[str] | None = None,
+    steering: bool = False,
+    supersede: bool = False,
 ) -> dict[str, Any]:
     if not events:
         raise ValueError("event batch cannot be empty")
     latest = events[-1]
     if len(events) == 1:
-        return crm_message(latest, crm_id, display_name, context, attachments)
+        event = latest
+        if supersede:
+            event = {
+                **latest,
+                "content": (
+                    "[Replacement request from Joe. Stop the prior task and use "
+                    "this as the active request.]\n\n"
+                    + latest["content"]
+                ),
+            }
+        elif steering:
+            event = {
+                **latest,
+                "content": (
+                    "[Steering message received while you were working. "
+                    "Incorporate it into the current task unless Joe explicitly "
+                    "replaces the task.]\n\n"
+                    + latest["content"]
+                ),
+            }
+        return crm_message(event, crm_id, display_name, context, attachments)
     content = "\n\n".join(
         f"[{index + 1}/{len(events)}] {event['content']}"
         for index, event in enumerate(events)
     )
+    if supersede:
+        content = (
+            "[Replacement request from Joe. Stop the prior task and use this as "
+            "the active request.]\n\n" + content
+        )
+    elif steering:
+        content = (
+            "[Steering message received while you were working. Incorporate it "
+            "into the current task unless Joe explicitly replaces the task.]\n\n"
+            + content
+        )
     return crm_message(
         {**latest, "content": content},
         crm_id,
@@ -369,7 +497,12 @@ class BridgeState:
         self.path = path
         self.data: dict[str, Any] = {
             "since": int(time.time()) - 5,
+            "channel_cursors": {},
             "events": {},
+            "pending": {},
+            "inbound_failures": {},
+            "inbound_dead_letters": [],
+            "active_turn": None,
             "outbound_failures": {},
             "profiles": {},
             "reply_routes": {},
@@ -378,17 +511,178 @@ class BridgeState:
         }
         if path.exists():
             self.data.update(json.loads(path.read_text()))
+        self.data.setdefault("startup_cursor", int(self.data["since"]))
+        self.data.setdefault("channel_cursors", {})
+        self.data.setdefault("pending", {})
+        self.data.setdefault("inbound_failures", {})
+        self.data.setdefault("inbound_dead_letters", [])
+        self.data.setdefault("active_turn", None)
 
     @property
     def since(self) -> int:
         return int(self.data["since"])
 
     def seen_event(self, event_id: str) -> bool:
-        return event_id in self.data["events"]
+        if event_id in self.data["events"]:
+            return True
+        if any(
+            event.get("id") == event_id
+            for queue in self.data["pending"].values()
+            for event in queue
+        ):
+            return True
+        active = self.data.get("active_turn") or {}
+        return any(event.get("id") == event_id for event in active.get("events", []))
 
     def mark_event(self, event_id: str, created_at: int) -> None:
         self.data["events"][event_id] = created_at
         self.data["since"] = max(self.since, created_at - 1)
+        if len(self.data["events"]) > 5000:
+            oldest = sorted(
+                self.data["events"],
+                key=lambda key: (self.data["events"][key], key),
+            )[:-5000]
+            for key in oldest:
+                self.data["events"].pop(key, None)
+
+    def cursor_for(self, channel_id: str) -> int:
+        return int(
+            self.data["channel_cursors"].get(
+                channel_id,
+                min(int(self.data.get("startup_cursor", self.since)), self.since),
+            )
+        )
+
+    def mark_observed(self, channel_id: str, event_id: str, created_at: int) -> None:
+        self.mark_event(event_id, created_at)
+        self.data["channel_cursors"][channel_id] = max(
+            self.cursor_for(channel_id),
+            created_at - 1,
+        )
+        self.save()
+
+    def queue_event(
+        self,
+        event: dict[str, Any],
+        max_pending: int,
+    ) -> dict[str, Any] | None:
+        if self.seen_event(str(event["id"])):
+            return None
+        channel_id = str(event["channel_id"])
+        queue = self.data["pending"].setdefault(channel_id, [])
+        queue.append(event)
+        queue.sort(key=lambda item: (int(item["created_at"]), str(item["id"])))
+        dropped = queue.pop(0) if len(queue) > max_pending else None
+        self.data["channel_cursors"][channel_id] = max(
+            self.cursor_for(channel_id),
+            int(event["created_at"]) - 1,
+        )
+        if dropped:
+            self.mark_event(str(dropped["id"]), int(dropped["created_at"]))
+            self.data["inbound_dead_letters"].append(
+                {"event": dropped, "error": "queue overflow", "failed_at": int(time.time())}
+            )
+            self.data["inbound_dead_letters"] = self.data["inbound_dead_letters"][-1000:]
+        self.save()
+        return dropped
+
+    def pending_count(self) -> int:
+        return sum(len(queue) for queue in self.data["pending"].values())
+
+    def oldest_pending_age(self, now: int | None = None) -> int:
+        timestamps = [
+            int(event["created_at"])
+            for queue in self.data["pending"].values()
+            for event in queue
+        ]
+        return max(0, (now or int(time.time())) - min(timestamps)) if timestamps else 0
+
+    def take_next_batch(
+        self,
+        *,
+        max_events: int,
+        owner_pubkey: str,
+        owner_only: bool = False,
+        now: int | None = None,
+    ) -> dict[str, Any] | None:
+        current = now or int(time.time())
+        candidates: list[tuple[int, str, str]] = []
+        for channel_id, queue in self.data["pending"].items():
+            ready = [
+                event
+                for event in queue
+                if int(event.get("_next_retry_at", 0)) <= current
+            ]
+            if owner_only:
+                ready = [
+                    event for event in ready if event.get("pubkey") == owner_pubkey
+                ]
+            if ready:
+                event = min(
+                    ready,
+                    key=lambda item: (int(item["created_at"]), str(item["id"])),
+                )
+                candidates.append(
+                    (int(event["created_at"]), str(event["id"]), channel_id)
+                )
+        if not candidates:
+            return None
+        _, _, channel_id = min(candidates)
+        queue = self.data["pending"][channel_id]
+        selected = [
+            event
+            for event in queue
+            if int(event.get("_next_retry_at", 0)) <= current
+            and (not owner_only or event.get("pubkey") == owner_pubkey)
+        ][:max_events]
+        selected_ids = {str(event["id"]) for event in selected}
+        self.data["pending"][channel_id] = [
+            event for event in queue if str(event["id"]) not in selected_ids
+        ]
+        if not self.data["pending"][channel_id]:
+            self.data["pending"].pop(channel_id, None)
+        self.save()
+        return {"channel_id": channel_id, "events": selected}
+
+    def record_inbound_failure(
+        self,
+        events: list[dict[str, Any]],
+        error: str,
+        max_attempts: int,
+        *,
+        permanent: bool = False,
+        now: int | None = None,
+    ) -> list[dict[str, Any]]:
+        current = now or int(time.time())
+        dead: list[dict[str, Any]] = []
+        for event in events:
+            event_id = str(event["id"])
+            for channel_id, queue in list(self.data["pending"].items()):
+                self.data["pending"][channel_id] = [
+                    queued for queued in queue if str(queued["id"]) != event_id
+                ]
+                if not self.data["pending"][channel_id]:
+                    self.data["pending"].pop(channel_id, None)
+            record = self.data["inbound_failures"].setdefault(
+                event_id, {"attempts": 0, "last_error": ""}
+            )
+            record["attempts"] += 1
+            record["last_error"] = error[:500]
+            if permanent or int(record["attempts"]) >= max_attempts:
+                item = {"event": event, "error": error[:500], "failed_at": current}
+                dead.append(item)
+                self.data["inbound_dead_letters"].append(item)
+                self.data["inbound_dead_letters"] = self.data["inbound_dead_letters"][-1000:]
+                self.mark_event(event_id, int(event["created_at"]))
+                continue
+            retry = {
+                **event,
+                "_attempts": int(record["attempts"]),
+                "_next_retry_at": current + min(300, 5 * (2 ** (int(record["attempts"]) - 1))),
+            }
+            self.data["pending"].setdefault(str(event["channel_id"]), []).append(retry)
+        self.save()
+        return dead
 
     def map_crm_reply(self, crm_id: str, channel_id: str, event_id: str) -> None:
         self.data["reply_routes"][crm_id] = {
@@ -525,10 +819,16 @@ class BuzzBridge:
             downloaded.append(str(target))
         return downloaded
 
-    def inject_event(self, event: dict[str, Any]) -> None:
-        self.inject_events([event])
+    def inject_event(self, event: dict[str, Any], *, steering: bool = False) -> None:
+        self.inject_events([event], steering=steering)
 
-    def inject_events(self, events: list[dict[str, Any]]) -> None:
+    def inject_events(
+        self,
+        events: list[dict[str, Any]],
+        *,
+        steering: bool = False,
+        supersede: bool = False,
+    ) -> None:
         events = [event for event in events if not self.state.seen_event(event["id"])]
         if not events:
             return
@@ -553,6 +853,8 @@ class BuzzBridge:
             display_name,
             context=context,
             attachments=attachments,
+            steering=steering,
+            supersede=supersede,
         )
         inbox = self.crm_root / "inbox" / "steve-kingsley"
         inbox.mkdir(parents=True, exist_ok=True)
@@ -563,8 +865,185 @@ class BuzzBridge:
         self.state.map_crm_reply(crm_id, event["channel_id"], event["id"])
         for item in events:
             self.state.mark_event(item["id"], item["created_at"])
+            self.state.data["inbound_failures"].pop(str(item["id"]), None)
+        now = int(time.time())
+        active = self.state.data.get("active_turn")
+        if steering and active:
+            active["crm_ids"] = [*active.get("crm_ids", []), crm_id]
+            active["events"] = [*active.get("events", []), *events]
+            active["steering"] = True
+        else:
+            self.state.data["active_turn"] = {
+                "channel_id": event["channel_id"],
+                "crm_ids": [crm_id],
+                "events": events,
+                "started_at": now,
+                "last_activity_at": now,
+                "pane_hash": "",
+                "stall_alerted": False,
+                "steering": steering,
+                "supersede": supersede,
+            }
         self.state.record_delivery()
         self.state.save()
+
+    def agent_busy(self) -> bool:
+        pane = subprocess.run(
+            [
+                "tmux",
+                "capture-pane",
+                "-t",
+                "crm-default-steve-kingsley:0.0",
+                "-p",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        tail = "\n".join(line for line in pane.splitlines() if line.strip())[-2000:]
+        return bool(re.search(r"esc to interrupt| tokens\)|\([0-9]+[ms]", tail))
+
+    def pane_digest(self) -> str:
+        pane = subprocess.run(
+            [
+                "tmux",
+                "capture-pane",
+                "-t",
+                "crm-default-steve-kingsley:0.0",
+                "-p",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+        return stable_pane_digest(pane)
+
+    def alert_stalled_turn(self, active: dict[str, Any], age: int) -> None:
+        subprocess.run(
+            [
+                "bash",
+                str(self.template_root / "core/bus/send-telegram.sh"),
+                "1242084718",
+                (
+                    "Steve Buzz turn stalled: "
+                    f"channel={active.get('channel_id')} age={age}s"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+        )
+
+    def expire_active_turn(self, active: dict[str, Any]) -> None:
+        self.cancel_current_turn()
+        events = list(active.get("events", []))
+        self.state.data["active_turn"] = None
+        for event in events:
+            self.state.data["events"].pop(str(event["id"]), None)
+            self.state.queue_event(event, self.policy.max_pending_per_channel)
+        self.state.save()
+
+    def monitor_turn(self, now: int | None = None) -> None:
+        active = self.state.data.get("active_turn")
+        if not active:
+            return
+        current = now or int(time.time())
+        age = current - int(active.get("started_at", current))
+        if not self.agent_busy():
+            if age >= 15:
+                self.state.data["active_turn"] = None
+                self.state.save()
+            return
+        if age >= self.policy.max_turn_seconds:
+            self.expire_active_turn(active)
+            return
+        digest = self.pane_digest()
+        if digest != active.get("pane_hash"):
+            active["pane_hash"] = digest
+            active["last_activity_at"] = current
+            active["stall_alerted"] = False
+            self.state.save()
+            return
+        stalled_for = current - int(active.get("last_activity_at", current))
+        if (
+            stalled_for >= self.policy.stall_alert_seconds
+            and not active.get("stall_alerted")
+        ):
+            self.alert_stalled_turn(active, stalled_for)
+            active["stall_alerted"] = True
+            self.state.save()
+
+    def write_inbound_dead_letter(self, item: dict[str, Any]) -> Path:
+        directory = self.crm_root / "dead-letter" / "buzz-inbound"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        event_id = re.sub(r"[^0-9A-Za-z_-]", "_", str(item["event"]["id"]))
+        path = directory / f"{event_id}.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(item, sort_keys=True) + "\n")
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+        return path
+
+    def alert_inbound_dead_letter(self, item: dict[str, Any]) -> None:
+        event = item["event"]
+        subprocess.run(
+            [
+                "bash",
+                str(self.template_root / "core/bus/send-telegram.sh"),
+                "1242084718",
+                (
+                    "Buzz inbound event quarantined: "
+                    f"channel={event.get('channel_id')} event={event.get('id')} "
+                    f"error={item.get('error', '')[:300]}"
+                ),
+            ],
+            check=False,
+            capture_output=True,
+        )
+
+    def quarantine_inbound(self, items: list[dict[str, Any]]) -> None:
+        for item in items:
+            self.write_inbound_dead_letter(item)
+            self.alert_inbound_dead_letter(item)
+
+    def dispatch_pending(self) -> None:
+        busy = self.agent_busy()
+        batch = self.state.take_next_batch(
+            max_events=self.policy.max_batch_events,
+            owner_pubkey=self.policy.owner_pubkey,
+            owner_only=busy,
+        )
+        if not batch:
+            return
+        events = batch["events"]
+        supersede = any(bool(event.get("_supersede")) for event in events)
+        try:
+            self.inject_events(
+                events,
+                steering=busy and not supersede,
+                supersede=supersede,
+            )
+        except (ValueError, PermissionError) as error:
+            dead = self.state.record_inbound_failure(
+                events,
+                str(error),
+                self.policy.max_inbound_attempts,
+                permanent=True,
+            )
+            self.quarantine_inbound(dead)
+        except (subprocess.CalledProcessError, json.JSONDecodeError, OSError) as error:
+            detail = (
+                error.stderr.strip()
+                if isinstance(error, subprocess.CalledProcessError) and error.stderr
+                else str(error)
+            )
+            permanent = isinstance(error, subprocess.CalledProcessError) and error.returncode == 3
+            dead = self.state.record_inbound_failure(
+                events,
+                detail,
+                self.policy.max_inbound_attempts,
+                permanent=permanent,
+            )
+            self.quarantine_inbound(dead)
 
     def cancel_current_turn(self) -> None:
         subprocess.run(
@@ -598,14 +1077,27 @@ class BuzzBridge:
         if command == "cancel":
             self.cancel_current_turn()
             confirmation = "Cancelled Steve's current turn."
-        else:
+        elif command == "rotate":
             self.send_control_confirmation(event, "Rotating Steve's session context.")
             self.rotate_session()
             confirmation = ""
+        else:
+            self.cancel_current_turn()
+            self.state.data["active_turn"] = None
+            replacement = str(event["content"]).strip()[len("!replace ") :].strip()
+            self.state.queue_event(
+                {**event, "content": replacement, "_supersede": True},
+                self.policy.max_pending_per_channel,
+            )
+            confirmation = ""
         if confirmation:
             self.send_control_confirmation(event, confirmation)
-        self.state.mark_event(event["id"], event["created_at"])
-        self.state.save()
+        if command != "replace":
+            self.state.mark_observed(
+                event["channel_id"],
+                event["id"],
+                event["created_at"],
+            )
         return True
 
     def alert_dead_letter(self, filename: str, detail: str) -> None:
@@ -645,6 +1137,10 @@ class BuzzBridge:
                 continue
             self.state.clear_outbound_failure(path.name)
             self.state.record_delivery()
+            active = self.state.data.get("active_turn") or {}
+            if str(message.get("reply_to") or "") in active.get("crm_ids", []):
+                self.state.data["active_turn"] = None
+                self.state.save()
             path.replace(processed / path.name)
 
     def tmux_health(self) -> tuple[bool, bool]:
@@ -673,6 +1169,7 @@ class BuzzBridge:
             if inbound_files
             else 0
         )
+        active = self.state.data.get("active_turn") or {}
         health = health_snapshot(
             relay_ok=relay_ok,
             tmux_ok=tmux_ok,
@@ -680,7 +1177,16 @@ class BuzzBridge:
             inbound_queue=len(inbound_files),
             outbound_queue=len(list((self.crm_root / "inbox/buzz").glob("*.json"))),
             dead_letters=len(list((self.crm_root / "dead-letter/buzz").glob("*.json"))),
+            inbound_dead_letters=len(
+                list((self.crm_root / "dead-letter/buzz-inbound").glob("*.json"))
+            ),
             oldest_inbound_age=oldest_inbound_age,
+            bridge_pending=self.state.pending_count(),
+            oldest_pending_age=self.state.oldest_pending_age(now),
+            active_channel=str(active.get("channel_id", "")),
+            active_turn_age=(
+                max(0, now - int(active.get("started_at", now))) if active else 0
+            ),
             last_delivery_at=int(self.state.data.get("last_delivery_at", 0)),
             last_error=str(self.state.data.get("last_error", "")),
             now=now,
@@ -703,9 +1209,8 @@ class BuzzBridge:
     def poll(self) -> None:
         self.forward_replies()
         channels = self.member_channels()
-        cursor = self.state.since
-        accepted: list[dict[str, Any]] = []
         for channel_id in channels:
+            cursor = self.state.cursor_for(channel_id)
             raw = self.buzz(
                 "messages",
                 "get",
@@ -716,21 +1221,31 @@ class BuzzBridge:
                 "--limit",
                 "100",
             )
-            for event in parse_buzz_messages(raw, self.public_key, self.state.since):
+            for event in parse_buzz_messages(raw, self.public_key, cursor):
                 if not event["channel_id"]:
                     event["channel_id"] = channel_id
                 if self.handle_control(event):
                     continue
                 if not accepts_event(event, channel_id, self.policy):
-                    self.state.mark_event(event["id"], event["created_at"])
-                    self.state.save()
+                    self.state.mark_observed(
+                        channel_id,
+                        event["id"],
+                        event["created_at"],
+                    )
                     continue
-                accepted.append(event)
-        for batch in batch_events_by_channel(accepted):
-            if len(batch) == 1:
-                self.inject_event(batch[0])
-            else:
-                self.inject_events(batch)
+                dropped = self.state.queue_event(
+                    event,
+                    self.policy.max_pending_per_channel,
+                )
+                if dropped:
+                    item = {
+                        "event": dropped,
+                        "error": "queue overflow",
+                        "failed_at": int(time.time()),
+                    }
+                    self.quarantine_inbound([item])
+        self.dispatch_pending()
+        self.monitor_turn()
         self.refresh_presence(self.write_health(relay_ok=True))
 
 
@@ -765,6 +1280,7 @@ def main() -> None:
         arguments.state,
         policy_path=arguments.policy,
     )
+    bridge.state.save()
     stopping = False
 
     def stop(_signum: int, _frame: Any) -> None:

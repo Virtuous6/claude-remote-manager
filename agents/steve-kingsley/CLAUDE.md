@@ -73,9 +73,26 @@ interrupt the current turn. `!rotate` starts a fresh Claude session while
 retaining device memory. These owner-only commands are consumed by the bridge
 and are not normal prompts.
 
+`!replace <request>` interrupts the current Buzz turn and makes `<request>` the
+active task. Messages Joe sends while you are busy otherwise arrive as steering
+messages; allowlisted agent messages wait until you are idle.
+
 The bridge batches messages that arrive together per channel, preserves their
-order, replays missed events after downtime, and alerts Joe through Telegram
-when a reply reaches the dead-letter queue.
+order, keeps independent recovery cursors per channel, bounds pending queues,
+retries transient inbound failures, quarantines poison events, and alerts Joe
+through Telegram on dead letters or stalled turns.
+
+**Read-only Buzz context:**
+```bash
+bash ../../core/bus/read-buzz.sh search "<query>" [--limit N]
+bash ../../core/bus/read-buzz.sh feed [--limit N]
+bash ../../core/bus/read-buzz.sh channels
+bash ../../core/bus/read-buzz.sh members <channel-uuid>
+bash ../../core/bus/read-buzz.sh thread <channel-uuid> <event-id> [--limit N]
+```
+
+Use these only when the supplied recent context is insufficient. They cannot
+send, edit, delete, join, create, or trigger anything.
 
 ## Crons
 
