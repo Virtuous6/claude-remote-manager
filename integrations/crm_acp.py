@@ -357,9 +357,11 @@ class CrmAcpFactory:
             "Tasks may not contain @ mentions. Other actions are `list`, `pause`, "
             "`resume`, `delete`, and `run_now`; mutations use the local schedule name. "
             "The adapter—not this Claude session—uses the managed Buzz identity. "
-            "Your Buzz response policy must allowlist only the pinned community relay "
-            "so relay-signed schedule posts reach CRM; the owner and verified "
-            "same-owner agents remain implicitly accepted.\n"
+            "Honor the response policy selected for you in Buzz: Only me, Anyone, "
+            "or Allowlist. Only the owner may mutate schedules. Scheduled work "
+            "requires either Anyone or an Allowlist containing the pinned community "
+            "relay; prefer Allowlist and keep any human entries the owner selected. "
+            "The owner and verified same-owner agents remain implicitly accepted.\n"
         )
         config = {
             "agent_name": record["slug"],
@@ -606,6 +608,8 @@ class BuzzTurnAuthorizer:
         owner_pubkey: str | None = None,
         agent_pubkey: str | None = None,
         relay_pubkey: str | None = None,
+        respond_to: str = "owner-only",
+        respond_to_allowlist: set[str] | frozenset[str] = frozenset(),
     ):
         values = (owner_pubkey, agent_pubkey, relay_pubkey)
         if any(value is not None for value in values) and not all(
@@ -613,15 +617,33 @@ class BuzzTurnAuthorizer:
             for value in values
         ):
             raise ValueError("invalid Buzz turn authorization configuration")
+        if respond_to not in {"owner-only", "allowlist", "anyone"}:
+            raise ValueError("invalid Buzz response policy")
+        normalized_allowlist = frozenset(respond_to_allowlist)
+        if not all(re.fullmatch(r"[0-9a-f]{64}", value) for value in normalized_allowlist):
+            raise ValueError("invalid Buzz response allowlist")
+        if respond_to != "allowlist" and normalized_allowlist:
+            raise ValueError("Buzz response allowlist requires allowlist policy")
         self.owner_pubkey = owner_pubkey
         self.agent_pubkey = agent_pubkey
         self.relay_pubkey = relay_pubkey
+        self.respond_to = respond_to
+        self.respond_to_allowlist = normalized_allowlist
 
     @classmethod
-    def from_environment(cls) -> "BuzzTurnAuthorizer":
-        private_key = os.environ.get("BUZZ_PRIVATE_KEY", "").strip()
-        auth_tag_json = os.environ.get("BUZZ_AUTH_TAG", "").strip()
-        relay_pubkey = os.environ.get("CRM_BUZZ_RELAY_PUBKEY", "").strip().lower()
+    def from_environment(
+        cls,
+        environment: dict[str, str] | None = None,
+    ) -> "BuzzTurnAuthorizer":
+        source = os.environ if environment is None else environment
+        private_key = source.get("BUZZ_PRIVATE_KEY", "").strip()
+        auth_tag_json = source.get("BUZZ_AUTH_TAG", "").strip()
+        relay_pubkey = source.get("CRM_BUZZ_RELAY_PUBKEY", "").strip().lower()
+        respond_to = source.get("BUZZ_ACP_RESPOND_TO", "owner-only").strip().lower()
+        raw_allowlist = source.get("BUZZ_ACP_RESPOND_TO_ALLOWLIST", "").strip().lower()
+        respond_to_allowlist = {
+            value.strip() for value in raw_allowlist.split(",") if value.strip()
+        }
         if not private_key and not auth_tag_json and not relay_pubkey:
             return cls()
         if not private_key or not auth_tag_json or not relay_pubkey:
@@ -636,6 +658,8 @@ class BuzzTurnAuthorizer:
             owner_pubkey=owner_pubkey,
             agent_pubkey=agent_pubkey,
             relay_pubkey=relay_pubkey,
+            respond_to=respond_to,
+            respond_to_allowlist=respond_to_allowlist,
         )
 
     def authorize(self, prompt: str) -> BuzzTurnIdentity:
@@ -663,6 +687,14 @@ class BuzzTurnAuthorizer:
                 or tags[0] != ["p", self.agent_pubkey]
             ):
                 raise PermissionError("Buzz workflow turn failed relay attribution")
+            if not (
+                self.respond_to == "anyone"
+                or (
+                    self.respond_to == "allowlist"
+                    and author in self.respond_to_allowlist
+                )
+            ):
+                raise PermissionError("Buzz workflow is blocked by response policy")
             return BuzzTurnIdentity(author, "workflow")
         if author == self.relay_pubkey:
             raise PermissionError("Buzz turn from relay lacks workflow attribution")
@@ -676,7 +708,14 @@ class BuzzTurnAuthorizer:
                     continue
                 if owner == self.owner_pubkey:
                     return BuzzTurnIdentity(author, "sibling")
-        raise PermissionError("Buzz turn author is not owner, sibling, or trusted workflow")
+        if self.respond_to == "anyone":
+            return BuzzTurnIdentity(author, "external")
+        if (
+            self.respond_to == "allowlist"
+            and author in self.respond_to_allowlist
+        ):
+            return BuzzTurnIdentity(author, "allowlist")
+        raise PermissionError("Buzz turn author is blocked by response policy")
 
     @staticmethod
     def require_owner(identity: BuzzTurnIdentity) -> None:

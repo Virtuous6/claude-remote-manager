@@ -74,6 +74,8 @@ class BuzzTurnAuthorizerTest(unittest.TestCase):
             owner_pubkey=OWNER_PUBKEY,
             agent_pubkey=target,
             relay_pubkey=RELAY_PUBKEY,
+            respond_to="allowlist",
+            respond_to_allowlist={RELAY_PUBKEY},
         )
         owner_turn = authorizer.authorize(event_prompt(OWNER_PUBKEY, []))
         sibling_turn = authorizer.authorize(
@@ -111,6 +113,87 @@ class BuzzTurnAuthorizerTest(unittest.TestCase):
                     ],
                 )
             )
+
+    def test_honors_buzz_owner_anyone_and_allowlist_policies(self):
+        external = "e" * 64
+        owner_only = BuzzTurnAuthorizer(
+            owner_pubkey=OWNER_PUBKEY,
+            agent_pubkey="f" * 64,
+            relay_pubkey=RELAY_PUBKEY,
+        )
+        anyone = BuzzTurnAuthorizer(
+            owner_pubkey=OWNER_PUBKEY,
+            agent_pubkey="f" * 64,
+            relay_pubkey=RELAY_PUBKEY,
+            respond_to="anyone",
+        )
+        allowlist = BuzzTurnAuthorizer(
+            owner_pubkey=OWNER_PUBKEY,
+            agent_pubkey="f" * 64,
+            relay_pubkey=RELAY_PUBKEY,
+            respond_to="allowlist",
+            respond_to_allowlist={external, RELAY_PUBKEY},
+        )
+
+        with self.assertRaisesRegex(PermissionError, "policy"):
+            owner_only.authorize(event_prompt(external, []))
+        self.assertEqual(anyone.authorize(event_prompt(external, [])).source, "external")
+        self.assertEqual(
+            allowlist.authorize(event_prompt(external, [])).source,
+            "allowlist",
+        )
+        with self.assertRaisesRegex(PermissionError, "policy"):
+            allowlist.authorize(event_prompt("d" * 64, []))
+
+    def test_workflows_require_anyone_or_relay_allowlist(self):
+        target = "f" * 64
+        prompt = event_prompt(
+            RELAY_PUBKEY,
+            [["p", target], ["buzz:workflow", "true"]],
+        )
+        owner_only = BuzzTurnAuthorizer(
+            owner_pubkey=OWNER_PUBKEY,
+            agent_pubkey=target,
+            relay_pubkey=RELAY_PUBKEY,
+        )
+        wrong_allowlist = BuzzTurnAuthorizer(
+            owner_pubkey=OWNER_PUBKEY,
+            agent_pubkey=target,
+            relay_pubkey=RELAY_PUBKEY,
+            respond_to="allowlist",
+            respond_to_allowlist={"e" * 64},
+        )
+        anyone = BuzzTurnAuthorizer(
+            owner_pubkey=OWNER_PUBKEY,
+            agent_pubkey=target,
+            relay_pubkey=RELAY_PUBKEY,
+            respond_to="anyone",
+        )
+
+        with self.assertRaisesRegex(PermissionError, "policy"):
+            owner_only.authorize(prompt)
+        with self.assertRaisesRegex(PermissionError, "policy"):
+            wrong_allowlist.authorize(prompt)
+        self.assertEqual(anyone.authorize(prompt).source, "workflow")
+
+    def test_reads_buzz_managed_response_policy_environment(self):
+        environment = {
+            "BUZZ_PRIVATE_KEY": "2".zfill(64),
+            "BUZZ_AUTH_TAG": json.dumps(
+                ["auth", OWNER_PUBKEY, SPEC_CONDITIONS, SPEC_SIGNATURE]
+            ),
+            "CRM_BUZZ_RELAY_PUBKEY": RELAY_PUBKEY,
+            "BUZZ_ACP_RESPOND_TO": "allowlist",
+            "BUZZ_ACP_RESPOND_TO_ALLOWLIST": f"{RELAY_PUBKEY},{'e' * 64}",
+        }
+
+        authorizer = BuzzTurnAuthorizer.from_environment(environment)
+
+        self.assertEqual(authorizer.respond_to, "allowlist")
+        self.assertEqual(
+            authorizer.respond_to_allowlist,
+            frozenset({RELAY_PUBKEY, "e" * 64}),
+        )
 
     def test_only_owner_can_mutate_workflows(self):
         authorizer = BuzzTurnAuthorizer(

@@ -200,12 +200,22 @@ turn, and CRM returns the work in the workflow message's thread. If an agent is
 renamed, adapter startup reconciles every recorded workflow to the new exact
 display name.
 
-Security requirement: set the managed agent's Buzz response policy to
-`allowlist` and add only the pinned community relay pubkey. Buzz Workflow
-messages are signed by the community relay, so Buzz ACP's default `owner-only`
-gate drops them before the custom harness can inspect them. Buzz implicitly
-retains the owner and cryptographically verified same-owner agents in
-`allowlist` mode.
+CRM agents retain Buzz's native response-policy control:
+
+- `Only me`: owner and cryptographically verified same-owner agents;
+- `Anyone`: any eligible channel member who mentions the agent;
+- `Allowlist`: owner, same-owner agents, and explicitly selected people.
+
+Buzz injects the selected policy and allowlist into the custom harness. CRM
+mirrors that gate, so choosing `Anyone` or adding a person to `Allowlist`
+actually permits that person to work with the CRM agent. Buzz's DM hardening
+still restricts direct messages to the owner and verified same-owner agents.
+
+Scheduled work additionally requires either `Anyone` or an `Allowlist`
+containing the pinned community relay pubkey. Workflow messages are signed by
+the community relay, so `Only me` drops them before the custom harness can
+inspect them. Prefer `Allowlist`: add the relay alongside any people who should
+use the agent.
 
 CRM independently verifies every accepted turn as:
 
@@ -214,10 +224,11 @@ CRM independently verifies every accepted turn as:
 - relay-signed `buzz:workflow` events whose first attribution tag is this
   managed agent.
 
-The trusted relay public key is pinned in the harness. Other humans,
-unattributed relay events, forged sibling attestations, and workflows owned by
-another identity fail before reaching the CRM inbox. Only the direct owner may
-create, change, pause, resume, delete, or run a workflow.
+The trusted relay public key is pinned in the harness. Humans excluded by the
+selected Buzz policy, unattributed relay events, forged sibling attestations,
+and workflows owned by another identity fail before reaching the CRM inbox.
+Only the direct owner may create, change, pause, resume, delete, or run a
+workflow, even when the agent is set to `Anyone`.
 
 For Neustac, the pinned relay identity is the documented `Buzz Relay Service`
 admin identity. If the community relay key rotates, update and redeploy every
@@ -233,9 +244,9 @@ Current limits:
   not configurable in CRM yet.
 - A workflow stays bound to its original channel. Updating it elsewhere changes
   the task or schedule, not the destination.
-- A new managed agent starts `owner-only`; switch it to the one-key relay
-  allowlist after selecting CRM ACP or its workflow posts will remain visible
-  but will not wake the agent.
+- A new managed agent starts `Only me`. It may stay there until broader access
+  or scheduling is needed. For schedules, choose `Allowlist` and add the relay
+  plus any approved people, or choose `Anyone`.
 
 ### Local CRM Crons
 
