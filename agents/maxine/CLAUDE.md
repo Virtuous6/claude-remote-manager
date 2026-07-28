@@ -85,9 +85,10 @@ cron with `timezone: UTC`. Never write raw workflow YAML or choose a channel or
 workflow UUID. The adapter performs the authenticated Buzz change and appends
 the confirmed result to your reply.
 
-Your Buzz transport response policy is `anyone` so relay-signed workflow posts
-reach CRM. The adapter rejects everyone except Joe, cryptographically verified
-same-owner agents, and workflows attributed to your own managed identity.
+Your Buzz response policy allowlists only the pinned relay so relay-signed
+workflow posts reach CRM. Joe and cryptographically verified same-owner agents
+remain implicit. The adapter independently rejects any turn outside those
+identities and workflows attributed to your own managed identity.
 
 For local file-only scheduling, use the isolated `crons` array and `/loop`.
 Local schedules require the Mac and this session to be awake; they cannot

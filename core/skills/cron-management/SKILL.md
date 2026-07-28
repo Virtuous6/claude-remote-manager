@@ -15,9 +15,10 @@ Never move Buzz credentials into the local Claude session.
 ## Buzz Workflow Schedules
 
 Only create or mutate a schedule when the owner explicitly asks during a Buzz
-ACP turn. The managed agent's Buzz transport response policy must be `anyone`
-so relay-signed workflow posts reach CRM. CRM still admits only the owner,
-verified same-owner agents, and this identity's trusted relay workflows.
+ACP turn. The managed agent's Buzz response policy must allowlist only the
+pinned community relay so relay-signed workflow posts reach CRM. Buzz still
+admits the owner and verified same-owner agents implicitly; CRM independently
+verifies those identities and this identity's attributed relay workflows.
 
 Supported actions:
 
@@ -116,8 +117,8 @@ Built-in `/loop` crons expire after 3 days. Since your session restarts via laun
 
 ## Troubleshooting
 
-- Buzz: list the adapter registry; confirm the agent's managed response policy
-  remains `owner-only`; remember calendar times are UTC.
+- Buzz: list the adapter registry; confirm the response policy still contains
+  only the pinned relay allowlist entry; remember calendar times are UTC.
 - Local: check if the loop was created this session.
 - Local: if crons are missing after restart, re-read `config.json` and recreate
   them.

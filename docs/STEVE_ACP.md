@@ -23,10 +23,11 @@ Telegram continues to enter the same Steve session through CRM.
   `/Users/josephsanchez/repos/claude-remote-manager/integrations/steve_acp.py`
 - Environment: `CRM_INSTANCE_ID=default` plus pinned Neustac relay pubkey
 
-Set Steve's managed Buzz response policy to `anyone`. Workflow messages are
-relay-signed and cannot pass the outer `owner-only` gate. Steve's CRM adapter
-then verifies the NIP-OA owner/sibling chain or the pinned relay workflow
-attribution before any turn reaches Steve.
+Set Steve's managed Buzz response policy to `allowlist` and add only the pinned
+Neustac relay pubkey. Workflow messages are relay-signed and cannot pass the
+outer `owner-only` gate. The owner and verified same-owner agents remain
+implicit; Steve's CRM adapter also verifies the NIP-OA owner/sibling chain or
+the pinned relay workflow attribution before any turn reaches Steve.
 
 Buzz stores the local definition at:
 
