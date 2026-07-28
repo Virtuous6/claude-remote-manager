@@ -1,6 +1,6 @@
 {
   "id": "crm-acp",
-  "name": "CRM ACP (Auto-Provision)",
+  "label": "CRM ACP (Auto-Provision)",
   "command": "/opt/homebrew/bin/python3.11",
   "args": [
     "/Users/josephsanchez/repos/claude-remote-manager-runtime/integrations/crm_acp.py",
