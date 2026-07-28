@@ -72,23 +72,61 @@ sensitive personal details in Buzz core.
 
 ## Register Harness
 
-Copy:
+The preferred runtime is the factory harness:
 
 ```text
-integrations/harnesses/maxine-acp.json
+integrations/harnesses/crm-acp.json
 ```
 
 to:
 
 ```text
-~/Library/Application Support/xyz.block.buzz.app/custom_harnesses/maxine-acp.json
+~/Library/Application Support/xyz.block.buzz.app/custom_harnesses/crm-acp.json
 ```
 
-Restart or reopen Buzz's runtime screen. Create a managed agent named `Maxine`,
-select the harness, then add her only to a private 1000 Months pilot channel.
+Restart or reopen Buzz's runtime screen. The selectable runtime is `CRM ACP
+(Auto-Provision)`.
 
-Buzz creates and holds Maxine's managed identity. Do not put a Buzz private key,
-auth tag, Telegram token, or other credential in the harness JSON.
+The fixed `maxine-acp.json` and `steve-acp.json` harnesses remain compatible for
+existing agents. Do not use them for new roles.
+
+## Create An Agent In Buzz
+
+1. Choose **Create agent** in Buzz.
+2. Set the agent name and instructions.
+3. Choose **Customize for this agent**.
+4. Select **CRM ACP (Auto-Provision)**.
+5. Leave its fixed CRM model selected.
+6. Optional: under Advanced, set `CRM_WORKSPACE` to an existing absolute
+   directory under `~/Documents` or `~/repos`.
+7. Create the agent and add it to its channels.
+
+On first spawn, the factory automatically creates:
+
+```text
+~/.claude-remote/<instance>/factory/
+  identities/<fingerprint>.json
+  agents/<slug>/
+  workspaces/<slug>/
+```
+
+It also registers a dedicated launchd service, tmux session, CRM inbox, ACP
+return inbox, Claude session UUID, and local history boundary. The Buzz agent
+name is presentation only. Renaming the agent reuses the same local identity.
+
+Buzz creates and holds each managed private identity. CRM hashes that identity
+in memory and persists only its SHA-256 fingerprint. Private keys, auth tags,
+Telegram tokens, and other credentials never belong in a harness or factory
+record.
+
+Factory directories are mode `0700`; records and generated agent files are
+`0600`. A Buzz model-discovery launch without a managed identity returns the
+fixed model but cannot process prompts. A managed launch missing its private
+identity fails closed.
+
+The generated agent receives its persona, role, and encrypted core from Buzz on
+each ACP turn. CRM supplies the persistent Claude process, workspace, tools,
+queues, and local history. Telegram and crons default off.
 
 ## Validation
 
@@ -110,23 +148,20 @@ Pilot checks:
 7. offline store-and-forward after the Mac reconnects;
 8. Steve and Maxine simultaneous turns with no inbox crossover.
 
-## Add Another Role
-
-Create an agent directory and a harness definition using the generic adapter:
-
-```text
-crm_acp.py --agent <slug> --display-name <name>
-```
-
-Keep the one-to-one mapping:
+## Isolation
 
 ```text
 one Buzz identity
-  = one harness definition
+  = one factory identity record
   = one CRM agent
   = one ACP return inbox
   = one tmux session
-  = one working directory
+  = one exact Claude session UUID
 ```
 
-Telegram remains optional per CRM agent with `telegram_enabled`.
+Agents may deliberately share a working directory while retaining distinct
+Claude session UUIDs and histories. Default workspaces are separate.
+
+Archiving or deleting an agent in Buzz does not delete local files or unload its
+launchd service in this first release. Remove that local runtime separately
+after confirming the Buzz identity is no longer needed.

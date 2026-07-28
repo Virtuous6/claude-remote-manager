@@ -88,6 +88,22 @@ class SteveAcpPureTest(unittest.TestCase):
             BuzzDestination(CHANNEL_ID, None),
         )
 
+    def test_destination_uses_thread_root_when_reply_hint_is_absent(self):
+        prompt = (
+            "[Context]\n"
+            "Scope: thread\n"
+            f"Channel: Testing Maxine (#{CHANNEL_ID})\n"
+            f"Thread root: {EVENT_ID}\n"
+            "Thread context included below.\n"
+            "[Thread Context (2 of 2 messages)]\n"
+            "Content: Hi Steve"
+        )
+
+        self.assertEqual(
+            parse_buzz_destination(prompt),
+            BuzzDestination(CHANNEL_ID, EVENT_ID),
+        )
+
     def test_destination_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "channel"):
             parse_buzz_destination("[Context]\nScope: channel\n[Event]\nhello")

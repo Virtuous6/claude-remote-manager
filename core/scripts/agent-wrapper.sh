@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # agent-wrapper.sh - Wrapper script for launchd-managed Claude Code agents
 # Handles crash counting, environment loading, rate limit detection, and respawn
-# Usage: agent-wrapper.sh <agent_name> <template_root>
+# Usage: agent-wrapper.sh <agent_name> <template_root> [agent_dir]
 #
 # Lifecycle:
 #   1. launchd starts this script
@@ -20,6 +20,8 @@ AGENT="$1"
 # Canonicalize to the physical path so a ~/Documents symlink can never poison
 # child cwd / launchd invocations under macOS TCC (Full Disk Access denials).
 TEMPLATE_ROOT="$(cd "$2" && pwd -P)"
+AGENT_DIR="${3:-${TEMPLATE_ROOT}/agents/${AGENT}}"
+AGENT_DIR="$(cd "${AGENT_DIR}" && pwd -P)"
 
 # Load instance ID from repo .env or environment
 REPO_ENV="${TEMPLATE_ROOT}/.env"
@@ -29,7 +31,6 @@ fi
 CRM_INSTANCE_ID="${CRM_INSTANCE_ID:-default}"
 
 CRM_ROOT="${HOME}/.claude-remote/${CRM_INSTANCE_ID}"
-AGENT_DIR="${TEMPLATE_ROOT}/agents/${AGENT}"
 LOG_DIR="${CRM_ROOT}/logs/${AGENT}"
 CRASH_LOG="${LOG_DIR}/crashes.log"
 CRASH_COUNT_FILE="${LOG_DIR}/.crash_count_today"
@@ -52,6 +53,7 @@ export CRM_AGENT_NAME="${AGENT}"
 export CRM_INSTANCE_ID="${CRM_INSTANCE_ID}"
 export CRM_ROOT="${CRM_ROOT}"
 export CRM_TEMPLATE_ROOT="${TEMPLATE_ROOT}"
+export CRM_AGENT_DIR="${AGENT_DIR}"
 
 # Check crash count for today (single-line format: date:count)
 TODAY=$(date +%Y-%m-%d)
@@ -107,6 +109,11 @@ MAX_SESSION=$(read_int_config '.max_session_seconds' 255600)
 
 # Model override: set "model" in config.json (e.g. "claude-haiku-4-5-20251001")
 MODEL=$(jq -r '.model // empty' "${AGENT_DIR}/config.json" 2>/dev/null || echo "")
+CLAUDE_SESSION_ID=$(jq -r '.claude_session_id // empty' "${AGENT_DIR}/config.json" 2>/dev/null || echo "")
+if [[ -n "${CLAUDE_SESSION_ID}" && ! "${CLAUDE_SESSION_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ERROR: invalid claude_session_id" >&2
+    exit 1
+fi
 TELEGRAM_ENABLED=$(jq -r '.telegram_enabled // true' "${AGENT_DIR}/config.json" 2>/dev/null || echo "true")
 if [[ "${TELEGRAM_ENABLED}" == "false" ]]; then
     unset BOT_TOKEN CHAT_ID ALLOWED_USER
@@ -210,7 +217,11 @@ if [[ -d "${CONV_DIR}" && -f "${HISTORY_SANITIZER}" ]]; then
     bash "${HISTORY_SANITIZER}" "${CONV_DIR}" >> "${LOG_DIR}/activity.log" 2>&1 || true
 fi
 HAS_CONVERSATION=false
-if [[ -d "${CONV_DIR}" ]] && ls "${CONV_DIR}"/*.jsonl &>/dev/null; then
+if [[ -n "${CLAUDE_SESSION_ID}" ]]; then
+    if find "${HOME}/.claude/projects" -type f -name "${CLAUDE_SESSION_ID}.jsonl" -print -quit 2>/dev/null | grep -q .; then
+        HAS_CONVERSATION=true
+    fi
+elif [[ -d "${CONV_DIR}" ]] && ls "${CONV_DIR}"/*.jsonl &>/dev/null; then
     HAS_CONVERSATION=true
 fi
 
@@ -277,10 +288,19 @@ write_claude_launcher() {
         printf 'export CRM_INSTANCE_ID=%q\n' "${CRM_INSTANCE_ID}"
         printf 'export CRM_ROOT=%q\n' "${CRM_ROOT}"
         printf 'export CRM_TEMPLATE_ROOT=%q\n' "${TEMPLATE_ROOT}"
+        printf 'export CRM_AGENT_DIR=%q\n' "${AGENT_DIR}"
         if [[ "${mode}" == "continue" ]]; then
-            printf 'ARGS=(--continue --dangerously-skip-permissions)\n'
+            if [[ -n "${CLAUDE_SESSION_ID}" ]]; then
+                printf 'ARGS=(--resume %q --dangerously-skip-permissions)\n' "${CLAUDE_SESSION_ID}"
+            else
+                printf 'ARGS=(--continue --dangerously-skip-permissions)\n'
+            fi
         else
-            printf 'ARGS=(--dangerously-skip-permissions)\n'
+            if [[ -n "${CLAUDE_SESSION_ID}" ]]; then
+                printf 'ARGS=(--session-id %q --dangerously-skip-permissions)\n' "${CLAUDE_SESSION_ID}"
+            else
+                printf 'ARGS=(--dangerously-skip-permissions)\n'
+            fi
         fi
         if [[ -n "${MODEL}" ]]; then
             printf 'ARGS+=(--model %q)\n' "${MODEL}"

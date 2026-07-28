@@ -10,6 +10,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 TEMPLATE_ROOT="${CRM_TEMPLATE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd -P)}"
 AGENT="${CRM_AGENT_NAME:-$(basename "$(pwd)")}"
+AGENT_DIR="${CRM_AGENT_DIR:-${TEMPLATE_ROOT}/agents/${AGENT}}"
+AGENT_DIR="$(cd "${AGENT_DIR}" && pwd -P)"
 
 # Load instance ID
 REPO_ENV="${TEMPLATE_ROOT}/.env"
@@ -34,6 +36,23 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] Hard-restart triggered. Reason: ${REASON}
 
 # Reset crash counter so launchd doesn't throttle
 rm -f "${LOG_DIR}/.crash_count_today"
+
+# Factory agents own an exact Claude session ID. A fresh launch cannot reuse an
+# ID that already has history, so rotate it atomically before setting the marker.
+CONFIG_FILE="${AGENT_DIR}/config.json"
+CLAUDE_SESSION_ID=$(jq -r '.claude_session_id // empty' "${CONFIG_FILE}" 2>/dev/null || echo "")
+if [[ -n "${CLAUDE_SESSION_ID}" ]]; then
+    if [[ ! "${CLAUDE_SESSION_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        echo "ERROR: invalid claude_session_id" >&2
+        exit 1
+    fi
+    NEW_SESSION_ID=$(uuidgen | tr 'A-F' 'a-f')
+    CONFIG_TMP=$(mktemp "${CONFIG_FILE}.XXXXXX")
+    jq --arg session "${NEW_SESSION_ID}" '.claude_session_id = $session' \
+        "${CONFIG_FILE}" > "${CONFIG_TMP}"
+    chmod 600 "${CONFIG_TMP}"
+    mv "${CONFIG_TMP}" "${CONFIG_FILE}"
+fi
 
 # Write force-fresh marker so agent-wrapper.sh uses STARTUP_PROMPT (no --continue)
 mkdir -p "${CRM_ROOT}/state"

@@ -1,0 +1,14 @@
+{
+  "id": "crm-acp",
+  "name": "CRM ACP (Auto-Provision)",
+  "command": "/opt/homebrew/bin/python3.11",
+  "args": [
+    "/Users/josephsanchez/repos/claude-remote-manager-runtime/integrations/crm_acp.py",
+    "--factory"
+  ],
+  "env": {
+    "CRM_INSTANCE_ID": "default"
+  },
+  "docsUrl": "",
+  "installHint": "Requires Claude Remote Manager and Claude Code on this computer."
+}
