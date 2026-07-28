@@ -80,10 +80,15 @@ chmod +x "${TEMPLATE_ROOT}/core/bus/"*.sh 2>/dev/null || true
 
 # Create per-agent state directories
 mkdir -p "${CRM_ROOT}/inbox/${AGENT}"
+chmod 700 "${CRM_ROOT}/inbox/${AGENT}"
 mkdir -p "${CRM_ROOT}/outbox/${AGENT}"
+chmod 700 "${CRM_ROOT}/outbox/${AGENT}"
 mkdir -p "${CRM_ROOT}/processed/${AGENT}"
+chmod 700 "${CRM_ROOT}/processed/${AGENT}"
 mkdir -p "${CRM_ROOT}/inflight/${AGENT}"
+chmod 700 "${CRM_ROOT}/inflight/${AGENT}"
 mkdir -p "${CRM_ROOT}/logs/${AGENT}"
+chmod 700 "${CRM_ROOT}/logs/${AGENT}"
 
 # Generate and load launchd plist
 echo ""
@@ -102,5 +107,10 @@ echo ""
 echo "  launchd: loaded (auto-restarts on crash)"
 echo "  tmux: attach with: tmux attach -t crm-${CRM_INSTANCE_ID}-${AGENT}"
 echo ""
-echo "  Test it: Send a message to the agent's Telegram bot"
+TELEGRAM_ENABLED=$(jq -r '.telegram_enabled // true' "${AGENT_DIR}/config.json" 2>/dev/null || echo "true")
+if [[ "${TELEGRAM_ENABLED}" == "false" ]]; then
+    echo "  Test it: Create/select the agent in Buzz"
+else
+    echo "  Test it: Send a message to the agent's Telegram bot"
+fi
 echo ""

@@ -117,6 +117,17 @@ class MaxinePilotFilesTest(unittest.TestCase):
         self.assertNotIn("private_key", serialized)
         self.assertNotIn("auth_tag", serialized)
 
+    def test_agent_enabler_keeps_state_private_and_telegram_optional(self):
+        script = Path("enable-agent.sh").read_text()
+
+        for directory in ("inbox", "outbox", "processed", "inflight", "logs"):
+            self.assertIn(
+                f'chmod 700 "${{CRM_ROOT}}/{directory}/${{AGENT}}"',
+                script,
+            )
+        self.assertIn('TELEGRAM_ENABLED=$(jq -r', script)
+        self.assertIn("Test it: Create/select the agent in Buzz", script)
+
 
 class CrmReplyTest(unittest.TestCase):
     def test_parses_core_update_from_correlated_envelope(self):
