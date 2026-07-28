@@ -360,6 +360,8 @@ class FactoryCliAndArtifactTest(unittest.TestCase):
         harness = json.loads(Path("integrations/harnesses/crm-acp.json").read_text())
 
         self.assertEqual(harness["id"], "crm-acp")
+        self.assertEqual(harness["label"], "CRM ACP (Auto-Provision)")
+        self.assertNotIn("name", harness)
         self.assertEqual(harness["args"][-1], "--factory")
         self.assertNotIn("--agent", harness["args"])
         self.assertEqual(harness["env"]["CRM_INSTANCE_ID"], "default")
