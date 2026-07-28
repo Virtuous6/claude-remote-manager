@@ -14,6 +14,7 @@ from integrations.crm_acp import (
     AgentConfig,
     BuzzDestination,
     BuzzMemoryWriter,
+    BuzzWorkflowOperation,
     CrmAcpAgent,
     CrmBus,
     CrmReply,
@@ -112,7 +113,11 @@ class MaxinePilotFilesTest(unittest.TestCase):
         self.assertEqual(
             harness["args"][-4:], ["--agent", "maxine", "--display-name", "Maxine"]
         )
-        self.assertEqual(harness["env"], {"CRM_INSTANCE_ID": "default"})
+        self.assertEqual(harness["env"]["CRM_INSTANCE_ID"], "default")
+        self.assertRegex(
+            harness["env"]["CRM_BUZZ_RELAY_PUBKEY"],
+            r"^[0-9a-f]{64}$",
+        )
         serialized = json.dumps(harness).lower()
         self.assertNotIn("private_key", serialized)
         self.assertNotIn("auth_tag", serialized)
@@ -356,6 +361,58 @@ class CrmAcpAgentTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             notify.await_args.args[0]["params"]["update"]["content"]["text"],
             "Keep the first line.",
+        )
+
+    async def test_workflow_result_is_confirmed_in_buzz_reply(self):
+        config = AgentConfig.create("maxine", "Maxine")
+        operation = BuzzWorkflowOperation.from_payload(
+            {
+                "action": "pause",
+                "name": "daily-review",
+            }
+        )
+        bus = Mock()
+        bus.wait_reply = AsyncMock(
+            return_value=CrmReply(
+                "I paused it.",
+                workflow_operation=operation,
+            )
+        )
+        publisher = Mock()
+        memory = Mock()
+        workflows = Mock()
+        workflows.apply.return_value = "Buzz schedule paused: daily-review."
+        agent = CrmAcpAgent(
+            config,
+            bus,
+            publisher,
+            memory,
+            workflows,
+            reply_timeout=1,
+        )
+        created = await agent.new_session({"cwd": "/tmp"})
+        notify = AsyncMock()
+
+        await agent.prompt(
+            {
+                "sessionId": created["sessionId"],
+                "prompt": [{"type": "text", "text": buzz_prompt()}],
+            },
+            notify,
+        )
+
+        workflows.apply.assert_called_once_with(
+            operation,
+            BuzzDestination(CHANNEL_ID, EVENT_ID),
+        )
+        visible = "I paused it.\n\nBuzz schedule paused: daily-review."
+        publisher.publish.assert_called_once_with(
+            BuzzDestination(CHANNEL_ID, EVENT_ID),
+            visible,
+        )
+        self.assertEqual(
+            notify.await_args.args[0]["params"]["update"]["content"]["text"],
+            visible,
         )
 
 

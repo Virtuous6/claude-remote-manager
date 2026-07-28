@@ -119,9 +119,26 @@ Defined in `config.json` under `crons` array. Set up once per session via `/loop
 
 Steve runs crons that need Telegram output. Desktop scheduled tasks handle file-only output (morning brief, guardian, relationship pulse, weekly/monthly review, contact builder).
 
-`beeper-monitor` checks Beeper conversations. `inbox-check` checks the internal
-Claude Remote Manager agent bus; the always-running fast-checker is the primary
-three-second inbox consumer, so the cron is only a redundant safety check.
+For reliable scheduled Buzz work, Joe must ask during a Buzz ACP turn. Use one
+typed operation at `$CRM_ROOT/state/steve-kingsley-workflow-op.json` and pass it
+to the correlated `send-acp-reply.sh` command with `--workflow`. Supported
+actions are `upsert`, `list`, `pause`, `resume`, `delete`, and `run_now`.
+Calendar cron is five-field UTC; intervals are at least 60 seconds. Tasks cannot
+contain `@` mentions. Never supply raw workflow YAML, a channel UUID, or a
+workflow UUID. The adapter makes the authenticated change and confirms it in
+Buzz.
+
+A Buzz transport response policy of `anyone` is required for scheduled
+workflow posts because they are relay-signed. The CRM ACP adapter still rejects
+everyone except Joe, verified same-owner agents, and workflows attributed to
+Steve's managed identity.
+
+A Telegram request can create Steve's existing local/Telegram cron, but it
+cannot create an authenticated Buzz Workflow because Telegram is not an active
+Buzz ACP turn.
+
+`beeper-monitor` checks Beeper conversations. The always-running fast-checker
+is the primary three-second CRM inbox consumer.
 
 ## Session Lifecycle
 

@@ -1,0 +1,14 @@
+{
+  "id": "steve-acp",
+  "label": "Steve Kingsley (CRM)",
+  "command": "/opt/homebrew/bin/python3.11",
+  "args": [
+    "/Users/josephsanchez/repos/claude-remote-manager-runtime/integrations/steve_acp.py"
+  ],
+  "env": {
+    "CRM_INSTANCE_ID": "default",
+    "STEVE_ACP_REPLY_TIMEOUT": "600",
+    "CRM_BUZZ_RELAY_PUBKEY": "8bcc2fb4a106d00d12e15ded255d3b13b13d367705e30d076d8a02e270c8f9be"
+  },
+  "installHint": "Requires the local Claude Remote Manager Steve session."
+}

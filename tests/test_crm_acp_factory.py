@@ -134,6 +134,10 @@ class CrmAcpFactoryTest(unittest.TestCase):
             self.assertEqual(config["crons"], [])
             self.assertNotIn(PRIVATE_KEY_A, identities[0].read_text())
             self.assertNotIn(PRIVATE_KEY_A, (agent_dir / "CLAUDE.md").read_text())
+            instructions = (agent_dir / "CLAUDE.md").read_text()
+            self.assertIn("Buzz Workflow", instructions)
+            self.assertIn("--workflow", instructions)
+            self.assertIn("UTC", instructions)
             self.assertEqual(agent_dir.stat().st_mode & 0o777, 0o700)
             self.assertEqual((agent_dir / "config.json").stat().st_mode & 0o777, 0o600)
             self.assertEqual((agent_dir / "CLAUDE.md").stat().st_mode & 0o777, 0o600)
@@ -358,7 +362,11 @@ class FactoryCliAndArtifactTest(unittest.TestCase):
         self.assertEqual(harness["id"], "crm-acp")
         self.assertEqual(harness["args"][-1], "--factory")
         self.assertNotIn("--agent", harness["args"])
-        self.assertEqual(harness["env"], {"CRM_INSTANCE_ID": "default"})
+        self.assertEqual(harness["env"]["CRM_INSTANCE_ID"], "default")
+        self.assertRegex(
+            harness["env"]["CRM_BUZZ_RELAY_PUBKEY"],
+            r"^[0-9a-f]{64}$",
+        )
         serialized = json.dumps(harness).lower()
         self.assertNotIn("private_key", serialized)
         self.assertNotIn("auth_tag", serialized)

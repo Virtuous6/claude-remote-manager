@@ -12,6 +12,8 @@ try:
         BuzzDestination,
         BuzzMemoryWriter,
         BuzzPublisher,
+        BuzzTurnAuthorizer,
+        BuzzWorkflowManager,
         CrmAcpAgent,
         CrmBus as GenericCrmBus,
         CrmReply,
@@ -28,6 +30,8 @@ except ModuleNotFoundError:
         BuzzDestination,
         BuzzMemoryWriter,
         BuzzPublisher,
+        BuzzTurnAuthorizer,
+        BuzzWorkflowManager,
         CrmAcpAgent,
         CrmBus as GenericCrmBus,
         CrmReply,
@@ -98,12 +102,16 @@ class SteveAcpAgent(CrmAcpAgent):
         *,
         reply_timeout: float = 600,
         memory: BuzzMemoryWriter | None = None,
+        workflows: BuzzWorkflowManager | None = None,
+        authorizer: BuzzTurnAuthorizer | None = None,
     ):
         super().__init__(
             STEVE_CONFIG,
             bus,
             publisher,
             memory or BuzzMemoryWriter(),
+            workflows,
+            authorizer,
             reply_timeout=reply_timeout,
         )
 
@@ -120,12 +128,17 @@ async def main() -> None:
             os.environ.get("CRM_ACP_REPLY_TIMEOUT", "600"),
         )
     )
-    bus = CrmBus(default_crm_root())
+    crm_root = default_crm_root()
+    bus = CrmBus(crm_root)
+    workflows = BuzzWorkflowManager(STEVE_CONFIG, crm_root)
+    workflows.reconcile_title()
     agent = SteveAcpAgent(
         bus,
         BuzzPublisher(),
         reply_timeout=timeout,
         memory=BuzzMemoryWriter(),
+        workflows=workflows,
+        authorizer=BuzzTurnAuthorizer.from_environment(),
     )
     await JsonRpcServer(agent).run()
 
