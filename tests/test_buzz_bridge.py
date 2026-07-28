@@ -32,6 +32,7 @@ from integrations.buzz_bridge import (
     owner_control,
     read_command,
     render_context,
+    reply_mention_pubkeys,
     safe_attachment_path,
     send_proactive,
     stable_pane_digest,
@@ -116,6 +117,22 @@ class BuzzBridgeTest(unittest.TestCase):
         self.assertIn("channel-1", message["text"])
         self.assertIn("event-1", message["text"])
         self.assertIn("hello", message["text"])
+
+    def test_channel_reply_mentions_author_and_other_tagged_members(self):
+        event = {
+            "pubkey": OWNER_PUBKEY,
+            "tags": [
+                ["p", STEVE_PUBKEY],
+                ["p", "jake"],
+                ["p", "jake"],
+            ],
+        }
+
+        self.assertEqual(
+            reply_mention_pubkeys(event, "channel-1"),
+            [OWNER_PUBKEY, "jake"],
+        )
+        self.assertEqual(reply_mention_pubkeys(event, JOE_DM_CHANNEL), [])
 
     def test_crm_message_uses_name_context_attachments_and_owner_priority(self):
         message = crm_message(
@@ -206,7 +223,11 @@ class BuzzBridgeTest(unittest.TestCase):
             self.assertTrue(restored.seen_event("event-1"))
             self.assertEqual(
                 restored.reply_route("crm-1"),
-                {"channel_id": "channel-1", "event_id": "event-1"},
+                {
+                    "channel_id": "channel-1",
+                    "event_id": "event-1",
+                    "mention_pubkeys": [],
+                },
             )
             self.assertEqual(restored.since, 41)
 
@@ -670,7 +691,11 @@ class BuzzBridgeTest(unittest.TestCase):
             self.assertEqual(len(files), 1)
             self.assertEqual(
                 bridge.state.reply_route("buzz-event-1"),
-                {"channel_id": JOE_DM_CHANNEL, "event_id": "event-1"},
+                {
+                    "channel_id": JOE_DM_CHANNEL,
+                    "event_id": "event-1",
+                    "mention_pubkeys": [],
+                },
             )
 
     def test_forward_reply_success_and_dead_letter(self):
@@ -684,7 +709,21 @@ class BuzzBridgeTest(unittest.TestCase):
             first = inbox / "first.json"
             first.write_text(json.dumps({"reply_to": "crm-1", "text": "ok"}))
             bridge.buzz = Mock(return_value='{"accepted":true}')
+            bridge.lookup_profile = Mock(
+                side_effect=lambda pubkey: {
+                    OWNER_PUBKEY: "JLUCKY",
+                    "jake": "Jake",
+                }[pubkey]
+            )
+            bridge.state.data["reply_routes"]["crm-1"]["mention_pubkeys"] = [
+                OWNER_PUBKEY,
+                "jake",
+            ]
             bridge.forward_replies()
+            self.assertEqual(
+                bridge.buzz.call_args.kwargs["stdin"],
+                "@JLUCKY @Jake ok",
+            )
             self.assertTrue((bridge.crm_root / "processed/buzz/first.json").exists())
 
             second = inbox / "second.json"

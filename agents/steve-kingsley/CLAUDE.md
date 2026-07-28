@@ -88,6 +88,19 @@ thread only; replies remain attached to its root. Inbound subscriptions fail
 closed: DMs accept supported message kinds from Joe, channels require a tag, and
 tagged forum posts/comments are allowed while votes and unknown kinds are not.
 
+**Buzz ACP messages arrive as normal agent-bus messages from `buzz-acp`:**
+```
+=== AGENT MESSAGE from buzz-acp [msg_id: <turn-id>] ===
+=== BUZZ ACP TURN [session:<session-id>] ===
+<Buzz Context and Event blocks>
+Reply using: bash ../../core/bus/send-message.sh buzz-acp normal '<reply>' <turn-id>
+```
+
+Reply only through the supplied agent-bus route. The adapter publishes the text
+to the trusted Buzz channel/thread destination and returns it through ACP. Do
+not call the Buzz CLI directly for an ACP turn. Telegram continues through its
+existing route into this same Steve session.
+
 **Read-only Buzz context:**
 ```bash
 bash ../../core/bus/read-buzz.sh search "<query>" [--limit N]

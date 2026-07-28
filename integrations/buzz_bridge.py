@@ -341,6 +341,24 @@ def build_reply_arguments(channel_id: str, event_id: str) -> tuple[str, ...]:
     return tuple(arguments)
 
 
+def reply_mention_pubkeys(event: dict[str, Any], channel_id: str) -> list[str]:
+    if channel_id == JOE_DM_CHANNEL:
+        return []
+    pubkeys = [str(event.get("pubkey") or "")]
+    pubkeys.extend(
+        str(tag[1])
+        for tag in event.get("tags", [])
+        if isinstance(tag, list) and len(tag) >= 2 and tag[0] == "p"
+    )
+    return list(
+        dict.fromkeys(
+            pubkey
+            for pubkey in pubkeys
+            if pubkey and pubkey != STEVE_PUBKEY
+        )
+    )
+
+
 def render_context(
     messages: list[dict[str, Any]],
     current_event_id: str,
@@ -799,13 +817,20 @@ class BridgeState:
         self.save()
         return dead
 
-    def map_crm_reply(self, crm_id: str, channel_id: str, event_id: str) -> None:
+    def map_crm_reply(
+        self,
+        crm_id: str,
+        channel_id: str,
+        event_id: str,
+        mention_pubkeys: list[str] | None = None,
+    ) -> None:
         self.data["reply_routes"][crm_id] = {
             "channel_id": channel_id,
             "event_id": event_id,
+            "mention_pubkeys": mention_pubkeys or [],
         }
 
-    def reply_route(self, crm_id: str) -> dict[str, str] | None:
+    def reply_route(self, crm_id: str) -> dict[str, Any] | None:
         return self.data["reply_routes"].get(crm_id)
 
     def record_outbound_failure(
@@ -1016,7 +1041,12 @@ class BuzzBridge:
         temporary = final.with_suffix(".tmp")
         temporary.write_text(json.dumps(message) + "\n")
         temporary.replace(final)
-        self.state.map_crm_reply(crm_id, event["channel_id"], event["id"])
+        self.state.map_crm_reply(
+            crm_id,
+            event["channel_id"],
+            event["id"],
+            reply_mention_pubkeys(event, event["channel_id"]),
+        )
         for item in events:
             self.state.mark_event(item["id"], item["created_at"])
             self.state.data["inbound_failures"].pop(str(item["id"]), None)
@@ -1283,8 +1313,15 @@ class BuzzBridge:
             if route is None:
                 continue
             arguments = build_reply_arguments(route["channel_id"], route["event_id"])
+            content = str(message.get("text") or "")
+            mentions = [
+                f"@{self.state.profile_name(pubkey, self.lookup_profile)}"
+                for pubkey in route.get("mention_pubkeys", [])
+            ]
+            if mentions:
+                content = f"{' '.join(mentions)} {content}"
             try:
-                self.buzz(*arguments, stdin=str(message.get("text") or ""))
+                self.buzz(*arguments, stdin=content)
             except subprocess.CalledProcessError as error:
                 detail = (error.stderr or "Buzz send failed").strip()
                 if self.state.record_outbound_failure(
