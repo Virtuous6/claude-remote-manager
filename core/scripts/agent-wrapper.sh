@@ -107,6 +107,10 @@ MAX_SESSION=$(read_int_config '.max_session_seconds' 255600)
 
 # Model override: set "model" in config.json (e.g. "claude-haiku-4-5-20251001")
 MODEL=$(jq -r '.model // empty' "${AGENT_DIR}/config.json" 2>/dev/null || echo "")
+TELEGRAM_ENABLED=$(jq -r '.telegram_enabled // true' "${AGENT_DIR}/config.json" 2>/dev/null || echo "true")
+if [[ "${TELEGRAM_ENABLED}" == "false" ]]; then
+    unset BOT_TOKEN CHAT_ID ALLOWED_USER
+fi
 
 # Working directory override: set "working_directory" in config.json to launch
 # Claude Code in a different project directory. The agent's identity (CLAUDE.md,
@@ -166,7 +170,11 @@ json.dump(deep_merge(base, override), open(sys.argv[3], 'w'), indent=2)
 fi
 
 # Prompts - two distinct variants based on start mode
-RESTART_NOTIFY="After setting up crons, send a Telegram message to the user saying you are back online, what session this is, and what you are about to work on."
+if [[ "${TELEGRAM_ENABLED}" == "true" && -n "${BOT_TOKEN:-}" && -n "${CHAT_ID:-}" ]]; then
+    RESTART_NOTIFY="After setting up crons, send a Telegram message to the user saying you are back online, what session this is, and what you are about to work on."
+else
+    RESTART_NOTIFY="Telegram is disabled for this agent; do not send a startup message."
+fi
 CRON_SETUP_INSTRUCTION="Create one separate cron/loop for each enabled entry in the crons array. Do not combine entries into one dispatcher."
 
 # Check for handoff file from previous session (Fix 5: Graceful Context Handoff)

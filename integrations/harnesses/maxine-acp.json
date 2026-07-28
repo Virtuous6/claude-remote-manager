@@ -1,0 +1,16 @@
+{
+  "id": "maxine-acp",
+  "label": "Maxine (1000 Months CRM)",
+  "command": "/opt/homebrew/bin/python3.11",
+  "args": [
+    "/Users/josephsanchez/repos/claude-remote-manager/integrations/crm_acp.py",
+    "--agent",
+    "maxine",
+    "--display-name",
+    "Maxine"
+  ],
+  "env": {
+    "CRM_INSTANCE_ID": "default"
+  },
+  "installHint": "Requires the local Maxine Claude Remote Manager session."
+}
