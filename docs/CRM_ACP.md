@@ -128,6 +128,94 @@ The generated agent receives its persona, role, and encrypted core from Buzz on
 each ACP turn. CRM supplies the persistent Claude process, workspace, tools,
 queues, and local history. Telegram and crons default off.
 
+## Per-Agent Crons
+
+Every factory agent has an independent `crons` array in:
+
+```text
+~/.claude-remote/<instance>/factory/agents/<slug>/config.json
+```
+
+New agents start with no schedules. The owner may tell an agent to create,
+change, pause, or remove one. Until cron management is standardized in the
+factory instructions, say **save this as a persistent CRM cron**. The agent
+must:
+
+1. create the active Claude schedule;
+2. write the definition to its own `config.json`;
+3. verify it is active;
+4. recreate it from config after session refreshes or restarts.
+
+A basic interval definition is:
+
+```json
+{
+  "name": "project-check",
+  "interval": "30m",
+  "prompt": "Review the workspace and record material changes."
+}
+```
+
+Existing agents may also use a `cron` expression for calendar schedules. Store
+an explicit time zone with the task instructions until the control layer has a
+first-class `timezone` field.
+
+### Delivery Boundary
+
+CRM crons run inside the local Claude session. They can work on local files,
+repositories, and the CRM agent bus. They run only while the Mac and that
+agent's session are available.
+
+A factory agent cannot currently initiate a new Buzz message from a local cron.
+ACP is turn-based: Buzz retains the managed private key and gives CRM a
+correlated reply path only after a Buzz event starts a turn. The local tmux
+session intentionally does not receive that private key.
+
+Use:
+
+- a Buzz Workflow to trigger scheduled work that must publish in Buzz;
+- a CRM cron for local or computer-dependent work;
+- Telegram only after an agent receives its own optional token;
+- the workspace to hold cron output for the next Buzz turn.
+
+Steve's existing proactive Buzz helper is a fixed, Steve-specific compatibility
+path. It is not inherited by factory agents and should not become the generic
+credential model.
+
+### Planned Cron Control Layer
+
+The intended conversational interface is:
+
+```text
+create · list · pause · resume · delete · run now
+```
+
+Each schedule should eventually record:
+
+```text
+name
+schedule
+timezone
+task
+destination
+missed-run policy
+busy-run policy
+enabled status
+last run
+next run
+last error
+```
+
+Required behavior:
+
+- owner or allowlist authorization for schedule mutations;
+- atomic config updates and idempotent reconciliation after restart;
+- no duplicate loops;
+- explicit `skip`, `run-on-wake`, or `backfill` behavior after downtime;
+- explicit `queue`, `skip`, or `overlap` behavior when the agent is busy;
+- visible run status and errors;
+- awareness that frequent schedules consume Claude usage.
+
 ## Validation
 
 ```bash
@@ -165,3 +253,7 @@ Claude session UUIDs and histories. Default workspaces are separate.
 Archiving or deleting an agent in Buzz does not delete local files or unload its
 launchd service in this first release. Remove that local runtime separately
 after confirming the Buzz identity is no longer needed.
+
+Back up important workspaces separately. Buzz encrypted memory is portable, but
+local workspace files, CRM config, Claude history, and cron definitions are not
+Buzz backups.
