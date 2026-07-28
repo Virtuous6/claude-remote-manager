@@ -8,6 +8,7 @@ import asyncio
 import difflib
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -27,7 +28,18 @@ UUID_PATTERN = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 EVENT_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+WORKFLOW_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+CRON_PATTERN = re.compile(r"^[0-9*/,-]+(?: [0-9*/,-]+){4}$")
+INTERVAL_PATTERN = re.compile(r"^([1-9][0-9]*)([smhd])$")
 MAX_CORE_BYTES = 16_384
+MAX_WORKFLOW_TASK_BYTES = 4_096
+SECP256K1_FIELD = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+SECP256K1_GENERATOR = (
+    0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+    0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+)
+BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 Notify = Callable[[dict[str, Any]], Awaitable[None]]
 
 
@@ -333,7 +345,18 @@ class CrmAcpFactory:
             "through Telegram or another channel. Telegram and crons are disabled by "
             "default. Explicit core-memory replacements are allowed without owner "
             "approval when they improve durable identity or working preferences; keep "
-            "them concise and exclude secrets.\n"
+            "them concise and exclude secrets.\n\n"
+            "For reliable scheduled Buzz work, use a Buzz Workflow operation only "
+            "when the owner explicitly asks to create, change, list, pause, resume, "
+            "delete, or run a schedule. Write one typed JSON object to "
+            f"`$CRM_ROOT/state/{record['slug']}-workflow-op.json` and pass it with "
+            "`--workflow` to the correlated reply helper. Never write raw workflow "
+            "YAML or request a channel ID/workflow ID directly. Upsert fields are "
+            "`action`, slug-like `name`, `task`, and either `interval` (minimum 60s) "
+            "or five-field `cron` plus `timezone: UTC`. Buzz calendar cron is UTC. "
+            "Tasks may not contain @ mentions. Other actions are `list`, `pause`, "
+            "`resume`, `delete`, and `run_now`; mutations use the local schedule name. "
+            "The adapter—not this Claude session—uses the managed Buzz identity.\n"
         )
         config = {
             "agent_name": record["slug"],
@@ -391,6 +414,759 @@ class BuzzDestination:
             raise ValueError("invalid Buzz reply event ID")
 
 
+def _point_add(
+    first: tuple[int, int] | None,
+    second: tuple[int, int] | None,
+) -> tuple[int, int] | None:
+    if first is None:
+        return second
+    if second is None:
+        return first
+    x1, y1 = first
+    x2, y2 = second
+    if x1 == x2 and (y1 != y2 or y1 == 0):
+        return None
+    if first == second:
+        slope = (3 * x1 * x1) * pow(2 * y1, SECP256K1_FIELD - 2, SECP256K1_FIELD)
+    else:
+        slope = (y2 - y1) * pow(x2 - x1, SECP256K1_FIELD - 2, SECP256K1_FIELD)
+    slope %= SECP256K1_FIELD
+    x3 = (slope * slope - x1 - x2) % SECP256K1_FIELD
+    y3 = (slope * (x1 - x3) - y1) % SECP256K1_FIELD
+    return x3, y3
+
+
+def _point_multiply(
+    scalar: int,
+    point: tuple[int, int],
+) -> tuple[int, int] | None:
+    result = None
+    addend: tuple[int, int] | None = point
+    value = scalar % SECP256K1_ORDER
+    while value:
+        if value & 1:
+            result = _point_add(result, addend)
+        addend = _point_add(addend, addend)
+        value >>= 1
+    return result
+
+
+def _lift_x(value: int) -> tuple[int, int]:
+    if value >= SECP256K1_FIELD:
+        raise ValueError("invalid Nostr public key")
+    square = (pow(value, 3, SECP256K1_FIELD) + 7) % SECP256K1_FIELD
+    y = pow(square, (SECP256K1_FIELD + 1) // 4, SECP256K1_FIELD)
+    if pow(y, 2, SECP256K1_FIELD) != square:
+        raise ValueError("invalid Nostr public key")
+    return value, y if y % 2 == 0 else SECP256K1_FIELD - y
+
+
+def _bech32_polymod(values: Sequence[int]) -> int:
+    checksum = 1
+    generators = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    for value in values:
+        top = checksum >> 25
+        checksum = ((checksum & 0x1FFFFFF) << 5) ^ value
+        for index, generator in enumerate(generators):
+            if (top >> index) & 1:
+                checksum ^= generator
+    return checksum
+
+
+def _decode_nsec(value: str) -> str:
+    if not value.startswith("nsec1") or value.lower() != value:
+        raise ValueError("invalid Buzz managed identity")
+    payload = value[5:]
+    try:
+        data = [BECH32_CHARSET.index(character) for character in payload]
+    except ValueError:
+        raise ValueError("invalid Buzz managed identity") from None
+    expanded = [ord(character) >> 5 for character in "nsec"]
+    expanded += [0]
+    expanded += [ord(character) & 31 for character in "nsec"]
+    if len(data) < 7 or _bech32_polymod(expanded + data) != 1:
+        raise ValueError("invalid Buzz managed identity")
+    bits = 0
+    accumulator = 0
+    decoded = bytearray()
+    for item in data[:-6]:
+        accumulator = (accumulator << 5) | item
+        bits += 5
+        while bits >= 8:
+            bits -= 8
+            decoded.append((accumulator >> bits) & 0xFF)
+    if bits >= 5 or ((accumulator << (8 - bits)) & 0xFF):
+        raise ValueError("invalid Buzz managed identity")
+    if len(decoded) != 32:
+        raise ValueError("invalid Buzz managed identity")
+    return decoded.hex()
+
+
+def _nostr_public_key(private_key: str) -> str:
+    secret = _decode_nsec(private_key) if private_key.startswith("nsec1") else private_key
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", secret):
+        raise ValueError("invalid Buzz managed identity")
+    scalar = int(secret, 16)
+    if scalar <= 0 or scalar >= SECP256K1_ORDER:
+        raise ValueError("invalid Buzz managed identity")
+    point = _point_multiply(scalar, SECP256K1_GENERATOR)
+    if point is None:
+        raise ValueError("invalid Buzz managed identity")
+    return f"{point[0]:064x}"
+
+
+def _tagged_hash(tag: str, value: bytes) -> bytes:
+    tag_hash = hashlib.sha256(tag.encode("ascii")).digest()
+    return hashlib.sha256(tag_hash + tag_hash + value).digest()
+
+
+def _verify_bip340(public_key: str, message: bytes, signature: str) -> bool:
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", public_key)
+        or len(message) != 32
+        or not re.fullmatch(r"[0-9a-f]{128}", signature)
+    ):
+        return False
+    public_x = int(public_key, 16)
+    r = int(signature[:64], 16)
+    s = int(signature[64:], 16)
+    if public_x >= SECP256K1_FIELD or r >= SECP256K1_FIELD or s >= SECP256K1_ORDER:
+        return False
+    try:
+        point = _lift_x(public_x)
+    except ValueError:
+        return False
+    challenge = int.from_bytes(
+        _tagged_hash(
+            "BIP0340/challenge",
+            r.to_bytes(32, "big") + public_x.to_bytes(32, "big") + message,
+        ),
+        "big",
+    ) % SECP256K1_ORDER
+    negative = (point[0], (-point[1]) % SECP256K1_FIELD)
+    result = _point_add(
+        _point_multiply(s, SECP256K1_GENERATOR),
+        _point_multiply(challenge, negative),
+    )
+    return result is not None and result[1] % 2 == 0 and result[0] == r
+
+
+def _valid_nip_oa_conditions(conditions: str) -> bool:
+    if not conditions:
+        return True
+    if any(character.isspace() for character in conditions):
+        return False
+    for clause in conditions.split("&"):
+        match = re.fullmatch(r"(kind=|created_at<|created_at>)(0|[1-9][0-9]*)", clause)
+        if match is None:
+            return False
+        value = int(match.group(2))
+        maximum = 65_535 if match.group(1) == "kind=" else 4_294_967_295
+        if value > maximum:
+            return False
+    return True
+
+
+def _verify_nip_oa_tag(tag: Any, agent_pubkey: str) -> str:
+    if (
+        not isinstance(tag, list)
+        or len(tag) != 4
+        or tag[0] != "auth"
+        or not all(isinstance(item, str) for item in tag)
+    ):
+        raise ValueError("invalid Buzz owner auth tag")
+    owner_pubkey, conditions, signature = tag[1], tag[2], tag[3]
+    if (
+        owner_pubkey == agent_pubkey
+        or not re.fullmatch(r"[0-9a-f]{64}", owner_pubkey)
+        or not _valid_nip_oa_conditions(conditions)
+    ):
+        raise ValueError("invalid Buzz owner auth tag")
+    preimage = f"nostr:agent-auth:{agent_pubkey}:{conditions}".encode("utf-8")
+    message = hashlib.sha256(preimage).digest()
+    if not _verify_bip340(owner_pubkey, message, signature):
+        raise ValueError("invalid Buzz owner auth tag")
+    return owner_pubkey
+
+
+@dataclass(frozen=True)
+class BuzzTurnIdentity:
+    author_pubkey: str | None
+    source: str
+    owner: bool = False
+
+
+class BuzzTurnAuthorizer:
+    def __init__(
+        self,
+        *,
+        owner_pubkey: str | None = None,
+        agent_pubkey: str | None = None,
+        relay_pubkey: str | None = None,
+    ):
+        values = (owner_pubkey, agent_pubkey, relay_pubkey)
+        if any(value is not None for value in values) and not all(
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+            for value in values
+        ):
+            raise ValueError("invalid Buzz turn authorization configuration")
+        self.owner_pubkey = owner_pubkey
+        self.agent_pubkey = agent_pubkey
+        self.relay_pubkey = relay_pubkey
+
+    @classmethod
+    def from_environment(cls) -> "BuzzTurnAuthorizer":
+        private_key = os.environ.get("BUZZ_PRIVATE_KEY", "").strip()
+        auth_tag_json = os.environ.get("BUZZ_AUTH_TAG", "").strip()
+        relay_pubkey = os.environ.get("CRM_BUZZ_RELAY_PUBKEY", "").strip().lower()
+        if not private_key and not auth_tag_json and not relay_pubkey:
+            return cls()
+        if not private_key or not auth_tag_json or not relay_pubkey:
+            raise ValueError("incomplete Buzz turn authorization configuration")
+        agent_pubkey = _nostr_public_key(private_key)
+        try:
+            auth_tag = json.loads(auth_tag_json)
+        except json.JSONDecodeError:
+            raise ValueError("invalid Buzz owner auth tag") from None
+        owner_pubkey = _verify_nip_oa_tag(auth_tag, agent_pubkey)
+        return cls(
+            owner_pubkey=owner_pubkey,
+            agent_pubkey=agent_pubkey,
+            relay_pubkey=relay_pubkey,
+        )
+
+    def authorize(self, prompt: str) -> BuzzTurnIdentity:
+        if self.owner_pubkey is None:
+            return BuzzTurnIdentity(None, "test", owner=True)
+        author_matches = re.findall(
+            r"(?m)^From: .*\bhex: ([0-9a-f]{64})\)",
+            prompt,
+        )
+        tag_matches = re.findall(r"(?m)^Tags: (.+)$", prompt)
+        if not author_matches or not tag_matches:
+            raise PermissionError("Buzz turn is missing authenticated event context")
+        author = author_matches[-1]
+        try:
+            tags = json.loads(tag_matches[-1])
+        except json.JSONDecodeError:
+            raise PermissionError("Buzz turn has invalid event tags") from None
+        if not isinstance(tags, list) or not all(isinstance(tag, list) for tag in tags):
+            raise PermissionError("Buzz turn has invalid event tags")
+        is_workflow = ["buzz:workflow", "true"] in tags
+        if is_workflow:
+            if (
+                author != self.relay_pubkey
+                or not tags
+                or tags[0] != ["p", self.agent_pubkey]
+            ):
+                raise PermissionError("Buzz workflow turn failed relay attribution")
+            return BuzzTurnIdentity(author, "workflow")
+        if author == self.relay_pubkey:
+            raise PermissionError("Buzz turn from relay lacks workflow attribution")
+        if author == self.owner_pubkey:
+            return BuzzTurnIdentity(author, "owner", owner=True)
+        for tag in tags:
+            if tag and tag[0] == "auth":
+                try:
+                    owner = _verify_nip_oa_tag(tag, author)
+                except ValueError:
+                    continue
+                if owner == self.owner_pubkey:
+                    return BuzzTurnIdentity(author, "sibling")
+        raise PermissionError("Buzz turn author is not owner, sibling, or trusted workflow")
+
+    @staticmethod
+    def require_owner(identity: BuzzTurnIdentity) -> None:
+        if not identity.owner:
+            raise PermissionError("only the Buzz agent owner can mutate workflows")
+
+
+@dataclass(frozen=True)
+class BuzzWorkflowOperation:
+    action: str
+    name: str | None = None
+    cron: str | None = None
+    interval: str | None = None
+    timezone_name: str | None = None
+    task: str | None = None
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> "BuzzWorkflowOperation":
+        if not isinstance(payload, dict):
+            raise ValueError("invalid Buzz workflow operation")
+        action = payload.get("action")
+        if action == "list":
+            if set(payload) != {"action"}:
+                raise ValueError("invalid Buzz workflow list operation")
+            return cls(action="list")
+        if action in {"pause", "resume", "delete", "run_now"}:
+            if set(payload) != {"action", "name"}:
+                raise ValueError("invalid Buzz workflow mutation")
+            name = payload.get("name")
+            cls._validate_name(name)
+            return cls(action=action, name=name)
+        if action != "upsert":
+            raise ValueError("invalid Buzz workflow action")
+
+        allowed = {"action", "name", "cron", "interval", "timezone", "task"}
+        if not set(payload).issubset(allowed):
+            raise ValueError("invalid Buzz workflow fields")
+        name = payload.get("name")
+        task = payload.get("task")
+        cron = payload.get("cron")
+        interval = payload.get("interval")
+        timezone_name = payload.get("timezone")
+        cls._validate_name(name)
+        if not isinstance(task, str) or not task.strip():
+            raise ValueError("invalid Buzz workflow task")
+        clean_task = task.strip()
+        if (
+            len(clean_task.encode("utf-8")) > MAX_WORKFLOW_TASK_BYTES
+            or any(ord(character) < 32 and character not in "\n\t" for character in clean_task)
+            or "@" in clean_task
+        ):
+            raise ValueError("invalid Buzz workflow task")
+        if (cron is None) == (interval is None):
+            raise ValueError("invalid Buzz workflow schedule")
+        if cron is not None:
+            if not isinstance(cron, str) or not CRON_PATTERN.fullmatch(cron):
+                raise ValueError("invalid Buzz workflow cron")
+            if timezone_name != "UTC":
+                raise ValueError("invalid Buzz workflow timezone; calendar crons require UTC")
+        else:
+            if timezone_name is not None:
+                raise ValueError("invalid Buzz workflow interval timezone")
+            cls._validate_interval(interval)
+        return cls(
+            action="upsert",
+            name=name,
+            cron=cron,
+            interval=interval,
+            timezone_name=timezone_name,
+            task=clean_task,
+        )
+
+    @staticmethod
+    def _validate_name(name: Any) -> None:
+        if not isinstance(name, str) or not WORKFLOW_NAME_PATTERN.fullmatch(name):
+            raise ValueError("invalid Buzz workflow name")
+
+    @staticmethod
+    def _validate_interval(interval: Any) -> None:
+        if not isinstance(interval, str):
+            raise ValueError("invalid Buzz workflow interval")
+        match = INTERVAL_PATTERN.fullmatch(interval)
+        if match is None:
+            raise ValueError("invalid Buzz workflow interval")
+        value = int(match.group(1))
+        seconds = value * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+        if seconds < 60:
+            raise ValueError("invalid Buzz workflow interval")
+
+    def schedule_label(self) -> str:
+        if self.cron:
+            return f"{self.cron} UTC"
+        return str(self.interval)
+
+
+class BuzzWorkflowManager:
+    def __init__(
+        self,
+        config: AgentConfig,
+        crm_root: Path,
+        *,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        authorization_material: str | None = None,
+    ):
+        self.config = config
+        self.crm_root = crm_root.expanduser()
+        self.runner = runner
+        if authorization_material is None:
+            managed_identity = os.environ.get("BUZZ_PRIVATE_KEY", "").strip()
+            managed_auth = os.environ.get("BUZZ_AUTH_TAG", "").strip()
+            managed_authorization = managed_identity if managed_auth else ""
+            if managed_authorization and not (
+                re.fullmatch(r"[0-9a-fA-F]{64}", managed_authorization)
+                or re.fullmatch(r"nsec1[02-9ac-hj-np-z]{58}", managed_authorization)
+            ):
+                raise ValueError("invalid Buzz workflow managed identity")
+        else:
+            managed_authorization = authorization_material
+        self.signing_key = (
+            hmac.new(
+                managed_authorization.encode("utf-8"),
+                b"crm-buzz-workflow-registry-v1",
+                hashlib.sha256,
+            ).digest()
+            if managed_authorization
+            else None
+        )
+        self.state_root = self.crm_root / "state"
+        self.registry_path = (
+            self.state_root / f"{self.config.agent_name}-buzz-workflows.json"
+        )
+        self.lock_path = (
+            self.state_root / f"{self.config.agent_name}-buzz-workflows.lock"
+        )
+
+    def apply(
+        self,
+        operation: BuzzWorkflowOperation,
+        destination: BuzzDestination,
+    ) -> str:
+        if self.signing_key is None:
+            raise PermissionError("Buzz workflow authorization is unavailable")
+        self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.state_root, 0o700)
+        lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(self.lock_path, 0o600)
+            with os.fdopen(lock_fd, "r+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                registry = self._load_registry()
+                status = self._apply_locked(operation, destination, registry)
+                return status
+        except Exception:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            raise
+
+    def reconcile_title(self) -> None:
+        if self.signing_key is None or not self.registry_path.exists():
+            return
+        self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.state_root, 0o700)
+        lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(self.lock_path, 0o600)
+            with os.fdopen(lock_fd, "r+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                registry = self._load_registry()
+                changed = False
+                for name, record in registry["schedules"].items():
+                    if record["agent_title"] == self.config.title:
+                        continue
+                    updated = dict(record)
+                    updated["agent_title"] = self.config.title
+                    updated["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    self._run(
+                        [
+                            "buzz",
+                            "workflows",
+                            "update",
+                            "--channel",
+                            updated["channel_id"],
+                            "--workflow",
+                            updated["workflow_id"],
+                            "--yaml",
+                            "-",
+                        ],
+                        input_text=self._definition(name, updated),
+                    )
+                    registry["schedules"][name] = updated
+                    changed = True
+                if changed:
+                    self._write_registry(registry)
+        except Exception:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            raise
+
+    def _apply_locked(
+        self,
+        operation: BuzzWorkflowOperation,
+        destination: BuzzDestination,
+        registry: dict[str, Any],
+    ) -> str:
+        schedules = registry["schedules"]
+        if operation.action == "list":
+            if not schedules:
+                return "Buzz schedules: none."
+            lines = []
+            for name, record in sorted(schedules.items()):
+                state = "active" if record["enabled"] else "paused"
+                schedule = (
+                    f"{record['cron']} UTC"
+                    if record.get("cron")
+                    else f"every {record['interval']}"
+                )
+                lines.append(f"- {name}: {state}, {schedule}")
+            return "Buzz schedules:\n" + "\n".join(lines)
+
+        name = str(operation.name)
+        record = schedules.get(name)
+        if operation.action == "upsert":
+            return self._upsert(operation, destination, registry, record)
+        if record is None:
+            raise ValueError(f"Buzz workflow not found: {name}")
+        if operation.action in {"pause", "resume"}:
+            enabled = operation.action == "resume"
+            updated = dict(record)
+            updated["enabled"] = enabled
+            updated["agent_title"] = self.config.title
+            updated["updated_at"] = datetime.now(timezone.utc).isoformat()
+            self._run(
+                [
+                    "buzz",
+                    "workflows",
+                    "update",
+                    "--channel",
+                    updated["channel_id"],
+                    "--workflow",
+                    updated["workflow_id"],
+                    "--yaml",
+                    "-",
+                ],
+                input_text=self._definition(name, updated),
+            )
+            schedules[name] = updated
+            self._write_registry(registry)
+            verb = "resumed" if enabled else "paused"
+            return f"Buzz schedule {verb}: {name}."
+        if operation.action == "run_now":
+            self._run(
+                [
+                    "buzz",
+                    "workflows",
+                    "trigger",
+                    "--workflow",
+                    record["workflow_id"],
+                ]
+            )
+            return f"Buzz schedule triggered: {name}."
+        if operation.action == "delete":
+            self._run(
+                [
+                    "buzz",
+                    "workflows",
+                    "delete",
+                    "--workflow",
+                    record["workflow_id"],
+                ]
+            )
+            del schedules[name]
+            self._write_registry(registry)
+            return f"Buzz schedule deleted: {name}."
+        raise ValueError("invalid Buzz workflow action")
+
+    def _upsert(
+        self,
+        operation: BuzzWorkflowOperation,
+        destination: BuzzDestination,
+        registry: dict[str, Any],
+        existing: dict[str, Any] | None,
+    ) -> str:
+        now = datetime.now(timezone.utc).isoformat()
+        record: dict[str, Any] = {
+            "name": operation.name,
+            "channel_id": (
+                existing["channel_id"] if existing else destination.channel_id
+            ),
+            "cron": operation.cron,
+            "interval": operation.interval,
+            "timezone": operation.timezone_name,
+            "task": operation.task,
+            "enabled": existing["enabled"] if existing else True,
+            "agent_title": self.config.title,
+            "created_at": existing["created_at"] if existing else now,
+            "updated_at": now,
+        }
+        if existing:
+            record["workflow_id"] = existing["workflow_id"]
+            arguments = [
+                "buzz",
+                "workflows",
+                "update",
+                "--channel",
+                record["channel_id"],
+                "--workflow",
+                record["workflow_id"],
+                "--yaml",
+                "-",
+            ]
+            self._run(arguments, input_text=self._definition(str(operation.name), record))
+            verb = "updated"
+        else:
+            arguments = [
+                "buzz",
+                "workflows",
+                "create",
+                "--channel",
+                record["channel_id"],
+                "--yaml",
+                "-",
+            ]
+            completed = self._run(
+                arguments,
+                input_text=self._definition(str(operation.name), record),
+            )
+            record["workflow_id"] = self._workflow_id(completed.stdout)
+            verb = "created"
+        registry["schedules"][str(operation.name)] = record
+        self._write_registry(registry)
+        return (
+            f"Buzz schedule {verb}: {operation.name} "
+            f"({operation.schedule_label()})."
+        )
+
+    def _definition(self, name: str, record: dict[str, Any]) -> str:
+        trigger: dict[str, str] = {"on": "schedule"}
+        if record.get("cron"):
+            trigger["cron"] = record["cron"]
+        else:
+            trigger["interval"] = record["interval"]
+        definition = {
+            "name": f"CRM {self.config.title}: {name}",
+            "description": (
+                f"CRM ACP schedule for {self.config.agent_name}; managed from Buzz."
+            ),
+            "trigger": trigger,
+            "steps": [
+                {
+                    "id": "wake_agent",
+                    "action": "send_message",
+                    "text": (
+                        f"@{self.config.title}\n"
+                        f"[CRM scheduled task: {name}]\n"
+                        f"{record['task']}"
+                    ),
+                }
+            ],
+            "enabled": bool(record["enabled"]),
+        }
+        return json.dumps(definition, separators=(",", ":"), ensure_ascii=False)
+
+    def _load_registry(self) -> dict[str, Any]:
+        if not self.registry_path.exists():
+            return {
+                "schema_version": 1,
+                "agent_name": self.config.agent_name,
+                "schedules": {},
+            }
+        if self.registry_path.is_symlink():
+            raise ValueError("invalid Buzz workflow registry")
+        registry = json.loads(self.registry_path.read_text())
+        if (
+            not isinstance(registry, dict)
+            or registry.get("schema_version") != 1
+            or registry.get("agent_name") != self.config.agent_name
+            or not isinstance(registry.get("schedules"), dict)
+        ):
+            raise ValueError("invalid Buzz workflow registry")
+        expected_integrity = self._registry_integrity(registry)
+        integrity = registry.get("integrity")
+        if (
+            not isinstance(integrity, str)
+            or not hmac.compare_digest(integrity, expected_integrity)
+        ):
+            raise ValueError("invalid Buzz workflow registry integrity")
+        for name, record in registry["schedules"].items():
+            self._validate_record(name, record)
+        return registry
+
+    def _write_registry(self, registry: dict[str, Any]) -> None:
+        registry["integrity"] = self._registry_integrity(registry)
+        temporary = self.registry_path.with_name(
+            f".{self.registry_path.name}.{os.getpid()}.tmp"
+        )
+        temporary.write_text(
+            json.dumps(registry, indent=2, sort_keys=True) + "\n"
+        )
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.registry_path)
+        os.chmod(self.registry_path, 0o600)
+
+    def _registry_integrity(self, registry: dict[str, Any]) -> str:
+        if self.signing_key is None:
+            raise PermissionError("Buzz workflow authorization is unavailable")
+        authenticated = {
+            key: value for key, value in registry.items() if key != "integrity"
+        }
+        canonical = json.dumps(
+            authenticated,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hmac.new(self.signing_key, canonical, hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def _validate_record(name: Any, record: Any) -> None:
+        required = {
+            "name",
+            "channel_id",
+            "cron",
+            "interval",
+            "timezone",
+            "task",
+            "enabled",
+            "agent_title",
+            "created_at",
+            "updated_at",
+            "workflow_id",
+        }
+        if (
+            not isinstance(name, str)
+            or not WORKFLOW_NAME_PATTERN.fullmatch(name)
+            or not isinstance(record, dict)
+            or set(record) != required
+            or record.get("name") != name
+            or not isinstance(record.get("enabled"), bool)
+            or not UUID_PATTERN.fullmatch(str(record.get("channel_id") or ""))
+            or not UUID_PATTERN.fullmatch(str(record.get("workflow_id") or ""))
+            or not isinstance(record.get("agent_title"), str)
+            or not isinstance(record.get("task"), str)
+        ):
+            raise ValueError("invalid Buzz workflow registry record")
+        operation_payload: dict[str, Any] = {
+            "action": "upsert",
+            "name": name,
+            "task": record["task"],
+        }
+        if record.get("cron"):
+            operation_payload.update(
+                {
+                    "cron": record["cron"],
+                    "timezone": record["timezone"],
+                }
+            )
+        else:
+            operation_payload["interval"] = record.get("interval")
+        BuzzWorkflowOperation.from_payload(operation_payload)
+
+    def _run(
+        self,
+        arguments: list[str],
+        *,
+        input_text: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return self.runner(
+                arguments,
+                input=input_text,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            raise RuntimeError("Buzz workflow command failed") from None
+
+    @staticmethod
+    def _workflow_id(output: str) -> str:
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            raise RuntimeError("Buzz workflow create returned an invalid response") from None
+        workflow_id = payload.get("workflow_id") if isinstance(payload, dict) else None
+        if not isinstance(workflow_id, str) or not UUID_PATTERN.fullmatch(workflow_id):
+            raise RuntimeError("Buzz workflow create returned no workflow ID")
+        return workflow_id
+
+
 @dataclass(frozen=True)
 class MemoryUpdate:
     slug: str
@@ -409,6 +1185,7 @@ class MemoryUpdate:
 class CrmReply:
     text: str
     memory_updates: tuple[MemoryUpdate, ...] = ()
+    workflow_operation: BuzzWorkflowOperation | None = None
 
     @classmethod
     def from_message(cls, message: dict[str, Any]) -> "CrmReply":
@@ -427,7 +1204,13 @@ class CrmReply:
             if not isinstance(slug, str) or not isinstance(value, str):
                 raise ValueError("invalid Buzz memory update")
             updates.append(MemoryUpdate(slug, value))
-        return cls(text.strip(), tuple(updates))
+        raw_workflow = message.get("buzz_workflow_operation")
+        workflow = (
+            None
+            if raw_workflow is None
+            else BuzzWorkflowOperation.from_payload(raw_workflow)
+        )
+        return cls(text.strip(), tuple(updates), workflow)
 
 
 def prompt_text(blocks: list[dict[str, Any]]) -> str:
@@ -513,7 +1296,14 @@ class CrmBus:
                 f"Normal: bash '{helper}' {self.config.adapter_name} {turn_id} "
                 "'<reply>'\n"
                 f"Core changed: bash '{helper}' {self.config.adapter_name} {turn_id} "
-                "'<reply>' '<full-core-file>'"
+                "'<reply>' '<full-core-file>'\n"
+                "Buzz schedule changed: write one typed operation to "
+                f"`$CRM_ROOT/state/{self.config.agent_name}-workflow-op.json`, then "
+                f"bash '{helper}' {self.config.adapter_name} {turn_id} '<reply>' "
+                f"--workflow '$CRM_ROOT/state/{self.config.agent_name}-workflow-op.json'. "
+                "Supported actions: upsert, list, pause, resume, delete, run_now. "
+                "Upsert uses name, task, and either interval or a five-field UTC cron "
+                "with timezone set to UTC. Never write raw workflow YAML."
             ),
             "reply_to": None,
         }
@@ -687,6 +1477,8 @@ class CrmAcpAgent:
         bus: CrmBus,
         publisher: BuzzPublisher,
         memory: BuzzMemoryWriter,
+        workflows: BuzzWorkflowManager | None = None,
+        authorizer: BuzzTurnAuthorizer | None = None,
         *,
         reply_timeout: float = 600,
     ):
@@ -694,6 +1486,8 @@ class CrmAcpAgent:
         self.bus = bus
         self.publisher = publisher
         self.memory = memory
+        self.workflows = workflows
+        self.authorizer = authorizer or BuzzTurnAuthorizer()
         self.reply_timeout = reply_timeout
         self.sessions: dict[str, dict[str, Any]] = {}
         self.cancel_events: dict[str, asyncio.Event] = {}
@@ -762,6 +1556,7 @@ class CrmAcpAgent:
         if session_id not in self.sessions:
             raise ValueError("unknown ACP session")
         content = prompt_text(list(params.get("prompt") or []))
+        turn_identity = self.authorizer.authorize(content)
         destination = parse_buzz_destination(content)
         system_prompt = str(
             self.sessions[session_id].get("system_prompt") or ""
@@ -784,7 +1579,17 @@ class CrmAcpAgent:
                     timeout=self.reply_timeout,
                 )
                 self.memory.apply(reply.memory_updates)
-                self.publisher.publish(destination, reply.text)
+                visible_reply = reply.text
+                if reply.workflow_operation is not None:
+                    if self.workflows is None:
+                        raise RuntimeError("Buzz workflow manager is unavailable")
+                    self.authorizer.require_owner(turn_identity)
+                    workflow_status = self.workflows.apply(
+                        reply.workflow_operation,
+                        destination,
+                    )
+                    visible_reply = f"{visible_reply}\n\n{workflow_status}"
+                self.publisher.publish(destination, visible_reply)
                 await notify(
                     {
                         "jsonrpc": "2.0",
@@ -793,7 +1598,7 @@ class CrmAcpAgent:
                             "sessionId": session_id,
                             "update": {
                                 "sessionUpdate": "agent_message_chunk",
-                                "content": {"type": "text", "text": reply.text},
+                                "content": {"type": "text", "text": visible_reply},
                             },
                         },
                     }
@@ -935,12 +1740,18 @@ def parse_agent_config(argv: list[str] | None = None) -> AgentConfig:
 
 async def run_agent(config: AgentConfig) -> None:
     timeout = float(os.environ.get("CRM_ACP_REPLY_TIMEOUT", "600"))
-    bus = CrmBus(default_crm_root(), config=config)
+    crm_root = default_crm_root()
+    bus = CrmBus(crm_root, config=config)
+    workflows = BuzzWorkflowManager(config, crm_root)
+    workflows.reconcile_title()
+    authorizer = BuzzTurnAuthorizer.from_environment()
     agent = CrmAcpAgent(
         config,
         bus,
         BuzzPublisher(),
         BuzzMemoryWriter(),
+        workflows,
+        authorizer,
         reply_timeout=timeout,
     )
     await JsonRpcServer(agent).run()

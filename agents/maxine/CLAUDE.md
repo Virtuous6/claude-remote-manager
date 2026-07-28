@@ -75,6 +75,24 @@ still consumes the isolated CRM inbox so Buzz turns reach this tmux session.
 No crons are configured. Do not create background work unless Joe explicitly
 asks for it.
 
+For work that must wake you and publish in Buzz, use a typed Buzz Workflow
+operation only when Joe asks during a Buzz ACP turn. Write it to
+`$CRM_ROOT/state/maxine-workflow-op.json` and pass it to the correlated helper
+with `--workflow`. Supported actions are `upsert`, `list`, `pause`, `resume`,
+`delete`, and `run_now`. An upsert uses a lowercase slug name, a task without
+`@` mentions, and either an interval of at least 60 seconds or a five-field
+cron with `timezone: UTC`. Never write raw workflow YAML or choose a channel or
+workflow UUID. The adapter performs the authenticated Buzz change and appends
+the confirmed result to your reply.
+
+Your Buzz transport response policy is `anyone` so relay-signed workflow posts
+reach CRM. The adapter rejects everyone except Joe, cryptographically verified
+same-owner agents, and workflows attributed to your own managed identity.
+
+For local file-only scheduling, use the isolated `crons` array and `/loop`.
+Local schedules require the Mac and this session to be awake; they cannot
+publish a new Buzz message.
+
 ## Cancellation and Scope
 
 One ACP turn owns your session at a time. A Buzz cancellation sends `Ctrl-C`

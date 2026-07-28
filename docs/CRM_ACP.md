@@ -99,7 +99,9 @@ existing agents. Do not use them for new roles.
 5. Leave its fixed CRM model selected.
 6. Optional: under Advanced, set `CRM_WORKSPACE` to an existing absolute
    directory under `~/Documents` or `~/repos`.
-7. Create the agent and add it to its channels.
+7. Under Advanced, set the Buzz response policy to **Anyone**. CRM applies the
+   narrower owner/sibling/attributed-workflow gate described below.
+8. Create the agent and add it to its channels.
 
 On first spawn, the factory automatically creates:
 
@@ -130,23 +132,128 @@ queues, and local history. Telegram and crons default off.
 
 ## Per-Agent Crons
 
-Every factory agent has an independent `crons` array in:
+CRM ACP now has two independent scheduling planes:
+
+- Buzz Workflows for reliable work that must wake the agent and publish in Buzz;
+- local CRM crons for computer-dependent or file-only work.
+
+### Buzz Workflow Control
+
+Ask the agent in the destination Buzz channel:
+
+```text
+Every weekday at 3pm UTC, review the writing corner and post the next useful
+move here. Save it as weekday-writing.
+```
+
+The agent emits one typed operation in its correlated ACP reply. The adapter:
+
+1. validates the operation;
+2. builds the workflow definition itself;
+3. uses the managed Buzz identity to create or update the channel workflow;
+4. stores the returned workflow ID in an authenticated private registry;
+5. appends the confirmed result to the visible Buzz reply.
+
+The local Claude/tmux session never receives the Buzz private key or auth tag.
+It cannot provide raw YAML, a channel ID, a workflow ID, or a shell command.
+
+Supported conversational actions:
+
+```text
+create or update · list · pause · resume · delete · run now
+```
+
+Example operation:
+
+```json
+{
+  "action": "upsert",
+  "name": "weekday-writing",
+  "cron": "0 15 * * 1-5",
+  "timezone": "UTC",
+  "task": "Review the writing corner and post the next useful move."
+}
+```
+
+Interval schedules use `interval` instead of `cron`, with a minimum of 60
+seconds. Calendar schedules use five-field cron and are UTC because Buzz's
+current workflow scheduler has no time-zone field. Tasks cannot contain `@`
+mentions; the adapter owns the only mention and targets the exact managed agent
+name.
+
+Workflow metadata is stored at:
+
+```text
+~/.claude-remote/<instance>/state/<agent>-buzz-workflows.json
+```
+
+The registry is mode `0600`, written atomically under a per-agent lock, and
+HMAC-authenticated with a one-way key derived in the adapter from the stable
+managed private identity. The identity and auth tag are never persisted.
+Tampering fails closed before a Buzz command runs. Repeating an upsert updates
+the recorded workflow rather than creating a duplicate.
+
+At runtime, the Buzz scheduler posts a top-level exact-name mention in the bound
+channel. Buzz resolves that channel member mention, starts a normal managed ACP
+turn, and CRM returns the work in the workflow message's thread. If an agent is
+renamed, adapter startup reconciles every recorded workflow to the new exact
+display name.
+
+Security requirement: set the managed agent's Buzz response policy to
+`anyone`. This is a transport setting, not the effective CRM policy. Buzz
+Workflow messages are signed by the community relay, so Buzz ACP's default
+`owner-only` gate drops them before the custom harness can inspect them.
+
+CRM immediately narrows the `anyone` transport back to:
+
+- the cryptographically attested owner;
+- agents carrying a valid NIP-OA attestation for that same owner;
+- relay-signed `buzz:workflow` events whose first attribution tag is this
+  managed agent.
+
+The trusted relay public key is pinned in the harness. Other humans,
+unattributed relay events, forged sibling attestations, and workflows owned by
+another identity fail before reaching the CRM inbox. Only the direct owner may
+create, change, pause, resume, delete, or run a workflow.
+
+For Neustac, the pinned relay identity is the documented `Buzz Relay Service`
+admin identity. If the community relay key rotates, update and redeploy every
+CRM harness before restoring schedule delivery.
+
+Current limits:
+
+- Buzz calendar cron is UTC; local-wall-clock/DST schedules are not translated.
+- Buzz's current CLI run-history command returns no relay execution events, so
+  CRM lists configuration status but not authoritative last/next-run history.
+- Workflow-generated messages are top-level. The agent's answer is threaded.
+- Busy-run and missed-run behavior belongs to Buzz's scheduler/ACP queue and is
+  not configurable in CRM yet.
+- A workflow stays bound to its original channel. Updating it elsewhere changes
+  the task or schedule, not the destination.
+- A new managed agent starts `owner-only`; switch it to `anyone` after selecting
+  CRM ACP or its workflow posts will remain visible but will not wake the agent.
+
+### Local CRM Crons
+
+Every factory agent also has an independent `crons` array in:
 
 ```text
 ~/.claude-remote/<instance>/factory/agents/<slug>/config.json
 ```
 
-New agents start with no schedules. The owner may tell an agent to create,
-change, pause, or remove one. Until cron management is standardized in the
-factory instructions, say **save this as a persistent CRM cron**. The agent
-must:
+New agents start with none. A local cron can work on files, repositories, the
+local CRM bus, or an agent-specific Telegram bot. It runs only while the Mac and
+that agent's Claude session are available. It cannot initiate a managed Buzz
+message.
 
-1. create the active Claude schedule;
-2. write the definition to its own `config.json`;
+Ask the agent to **save this as a persistent local CRM cron**. It must:
+
+1. create the active Claude `/loop`;
+2. persist the definition in its own `config.json`;
 3. verify it is active;
-4. recreate it from config after session refreshes or restarts.
+4. recreate it after a session refresh or restart.
 
-A basic interval definition is:
+Example:
 
 ```json
 {
@@ -156,65 +263,9 @@ A basic interval definition is:
 }
 ```
 
-Existing agents may also use a `cron` expression for calendar schedules. Store
-an explicit time zone with the task instructions until the control layer has a
-first-class `timezone` field.
-
-### Delivery Boundary
-
-CRM crons run inside the local Claude session. They can work on local files,
-repositories, and the CRM agent bus. They run only while the Mac and that
-agent's session are available.
-
-A factory agent cannot currently initiate a new Buzz message from a local cron.
-ACP is turn-based: Buzz retains the managed private key and gives CRM a
-correlated reply path only after a Buzz event starts a turn. The local tmux
-session intentionally does not receive that private key.
-
-Use:
-
-- a Buzz Workflow to trigger scheduled work that must publish in Buzz;
-- a CRM cron for local or computer-dependent work;
-- Telegram only after an agent receives its own optional token;
-- the workspace to hold cron output for the next Buzz turn.
-
-Steve's existing proactive Buzz helper is a fixed, Steve-specific compatibility
-path. It is not inherited by factory agents and should not become the generic
-credential model.
-
-### Planned Cron Control Layer
-
-The intended conversational interface is:
-
-```text
-create · list · pause · resume · delete · run now
-```
-
-Each schedule should eventually record:
-
-```text
-name
-schedule
-timezone
-task
-destination
-missed-run policy
-busy-run policy
-enabled status
-last run
-next run
-last error
-```
-
-Required behavior:
-
-- owner or allowlist authorization for schedule mutations;
-- atomic config updates and idempotent reconciliation after restart;
-- no duplicate loops;
-- explicit `skip`, `run-on-wake`, or `backfill` behavior after downtime;
-- explicit `queue`, `skip`, or `overlap` behavior when the agent is busy;
-- visible run status and errors;
-- awareness that frequent schedules consume Claude usage.
+Steve may still use his local schedules for Telegram work. A Telegram request
+does not carry an authenticated Buzz ACP turn, so it cannot create or mutate a
+Buzz Workflow. Frequent schedules consume Claude usage in either plane.
 
 ## Validation
 
