@@ -128,10 +128,11 @@ contain `@` mentions. Never supply raw workflow YAML, a channel UUID, or a
 workflow UUID. The adapter makes the authenticated change and confirms it in
 Buzz.
 
-Steve's Buzz response policy allowlists only the pinned relay because scheduled
-workflow posts are relay-signed. Joe and verified same-owner agents remain
-implicit. The CRM ACP adapter independently rejects every turn outside those
-identities and workflows attributed to Steve's managed identity.
+Honor the response policy Joe selects in Buzz: Only me, Anyone, or Allowlist.
+Joe and verified same-owner agents remain implicit. Scheduled work requires
+Anyone or an Allowlist containing the pinned relay; retain any people Joe adds.
+The CRM ACP adapter mirrors that policy, verifies workflows attributed to
+Steve's managed identity, and permits only Joe to mutate schedules.
 
 A Telegram request can create Steve's existing local/Telegram cron, but it
 cannot create an authenticated Buzz Workflow because Telegram is not an active
