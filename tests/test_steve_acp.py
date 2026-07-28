@@ -15,7 +15,9 @@ from unittest.mock import AsyncMock, Mock, patch
 from integrations.steve_acp import (
     BuzzDestination,
     BuzzPublisher,
+    BuzzMemoryWriter,
     CrmBus,
+    CrmReply,
     JsonRpcServer,
     SteveAcpAgent,
     TurnCancelled,
@@ -112,10 +114,10 @@ class SteveAcpPureTest(unittest.TestCase):
             )
 
     def test_publisher_uses_stdin_and_reply_anchor(self):
-        publisher = BuzzPublisher()
-        with patch("integrations.steve_acp.subprocess.run") as run:
-            run.return_value.stdout = '{"accepted":true}'
-            publisher.publish(BuzzDestination(CHANNEL_ID, EVENT_ID), "hello")
+        run = Mock()
+        run.return_value.stdout = '{"accepted":true}'
+        publisher = BuzzPublisher(runner=run)
+        publisher.publish(BuzzDestination(CHANNEL_ID, EVENT_ID), "hello")
 
         self.assertEqual(
             run.call_args.args[0],
@@ -135,10 +137,10 @@ class SteveAcpPureTest(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["check"])
 
     def test_publisher_supports_unthreaded_reply_and_rejects_empty(self):
-        publisher = BuzzPublisher()
-        with patch("integrations.steve_acp.subprocess.run") as run:
-            run.return_value.stdout = "ok"
-            publisher.publish(BuzzDestination(CHANNEL_ID), " dm ")
+        run = Mock()
+        run.return_value.stdout = "ok"
+        publisher = BuzzPublisher(runner=run)
+        publisher.publish(BuzzDestination(CHANNEL_ID), " dm ")
         self.assertNotIn("--reply-to", run.call_args.args[0])
         self.assertEqual(run.call_args.kwargs["input"], "dm")
         with self.assertRaisesRegex(ValueError, "empty"):
@@ -178,7 +180,7 @@ class CrmBusTest(unittest.IsolatedAsyncioTestCase):
                 timeout=1,
             )
 
-            self.assertEqual(reply, "Hello from Steve")
+            self.assertEqual(reply.text, "Hello from Steve")
             self.assertTrue((root / "processed/buzz-acp/reply.json").exists())
 
     async def test_wait_reply_honors_cancel(self):
@@ -218,6 +220,7 @@ class CrmBusTest(unittest.IsolatedAsyncioTestCase):
                 json.dumps(
                     {
                         "from": "steve-kingsley",
+                        "to": "buzz-acp",
                         "reply_to": "turn-1",
                         "text": " ",
                     }
@@ -228,12 +231,10 @@ class CrmBusTest(unittest.IsolatedAsyncioTestCase):
                 await bus.wait_reply("turn-1", asyncio.Event(), timeout=1)
 
     def test_cancel_active_targets_only_steve_tmux(self):
-        bus = CrmBus(Path("/tmp/unused"))
-        with (
-            patch.dict(os.environ, {"STEVE_TMUX_TARGET": "crm-test:0.0"}),
-            patch("integrations.steve_acp.subprocess.run") as run,
-        ):
-            bus.cancel_active()
+        with patch.dict(os.environ, {"STEVE_TMUX_TARGET": "crm-test:0.0"}):
+            bus = CrmBus(Path("/tmp/unused"))
+        run = Mock()
+        bus.cancel_active(runner=run)
         run.assert_called_once_with(
             ["tmux", "send-keys", "-t", "crm-test:0.0", "C-c"],
             check=False,
@@ -244,12 +245,14 @@ class CrmBusTest(unittest.IsolatedAsyncioTestCase):
 class SteveAcpAgentTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bus = Mock()
-        self.bus.wait_reply = AsyncMock(return_value="Steve's reply")
+        self.bus.wait_reply = AsyncMock(return_value=CrmReply("Steve's reply"))
         self.publisher = Mock()
+        self.memory = Mock(spec=BuzzMemoryWriter)
         self.agent = SteveAcpAgent(
             self.bus,
             self.publisher,
             reply_timeout=1,
+            memory=self.memory,
         )
 
     async def test_initialize_and_new_session(self):
@@ -433,8 +436,9 @@ class JsonRpcServerTest(unittest.IsolatedAsyncioTestCase):
             )
             + "\n"
         )
-        with patch("integrations.steve_acp.sys.stdin", input_lines), patch(
-            "integrations.steve_acp.sys.stdout", output
+        with (
+            patch("integrations.crm_acp.sys.stdin", input_lines),
+            patch("integrations.crm_acp.sys.stdout", output),
         ):
             await server.run()
 
@@ -519,7 +523,9 @@ class SteveAcpProcessTest(unittest.TestCase):
             deadline = time.monotonic() + 2
             inbound = []
             while time.monotonic() < deadline and not inbound:
-                inbound = list(inbound_dir.glob("*.json")) if inbound_dir.exists() else []
+                inbound = (
+                    list(inbound_dir.glob("*.json")) if inbound_dir.exists() else []
+                )
                 time.sleep(0.01)
             turn = json.loads(inbound[0].read_text())
             reply_dir = root / "inbox/buzz-acp"
@@ -528,6 +534,7 @@ class SteveAcpProcessTest(unittest.TestCase):
                 json.dumps(
                     {
                         "from": "steve-kingsley",
+                        "to": "buzz-acp",
                         "reply_to": turn["id"],
                         "text": "Live adapter reply",
                     }

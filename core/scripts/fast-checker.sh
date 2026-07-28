@@ -363,6 +363,10 @@ if [[ -f "$ENV_FILE" ]]; then
 elif [[ -f ".env" ]]; then
     set -a; source ".env"; set +a
 fi
+TELEGRAM_ENABLED=$(jq -r '.telegram_enabled // true' "${AGENT_DIR}/config.json" 2>/dev/null || echo "true")
+if [[ "${TELEGRAM_ENABLED}" == "false" ]]; then
+    unset BOT_TOKEN CHAT_ID ALLOWED_USER
+fi
 
 # Send a question from the ask state file to Telegram (inlined to avoid env issues)
 send_next_question() {
@@ -475,8 +479,12 @@ while true; do
 
     # --- Telegram ---
     # Capture offset in a temp file so we can commit it AFTER successful injection.
-    TG_OFFSET_FILE=$(mktemp /tmp/crm-tg-offset-XXXXXX 2>/dev/null || echo "/tmp/crm-tg-offset-$$")
-    TG_OUTPUT=$(CRM_DEFER_TELEGRAM_OFFSET_FILE="$TG_OFFSET_FILE" bash "${BUS_DIR}/check-telegram.sh" 2>/dev/null || echo "")
+    TG_OFFSET_FILE=""
+    TG_OUTPUT=""
+    if [[ "${TELEGRAM_ENABLED}" == "true" ]]; then
+        TG_OFFSET_FILE=$(mktemp /tmp/crm-tg-offset-XXXXXX 2>/dev/null || echo "/tmp/crm-tg-offset-$$")
+        TG_OUTPUT=$(CRM_DEFER_TELEGRAM_OFFSET_FILE="$TG_OFFSET_FILE" bash "${BUS_DIR}/check-telegram.sh" 2>/dev/null || echo "")
+    fi
     TG_NEW_OFFSET=""
     if [[ -f "$TG_OFFSET_FILE" ]]; then
         TG_NEW_OFFSET=$(grep '__OFFSET__:' "$TG_OFFSET_FILE" 2>/dev/null | sed 's/__OFFSET__://' || true)

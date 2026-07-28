@@ -84,7 +84,7 @@ mentions can produce conflicting replies.
 ## One-Brain Boundary
 
 This harness is a doorway to the existing `steve-kingsley` CRM agent. It is not
-yet a general agent factory.
+an agent factory.
 
 Creating another Buzz identity such as `Fizz` with this harness would still
 route its work into Steve's Claude session. The identities would share:
@@ -98,8 +98,7 @@ That can be intentional for clearly labeled Steve roles, but it is unsafe for
 independent personas because instructions, context, permissions, and replies
 could cross boundaries.
 
-A future generic `crm-acp` harness should map each Buzz agent to a distinct CRM
-agent:
+The generic `crm-acp` adapter now maps each Buzz agent to a distinct CRM agent:
 
 ```text
 Buzz Steve  → CRM steve-kingsley → Claude session A
@@ -109,6 +108,8 @@ Buzz Rachel → CRM rachel         → Claude session C
 
 Each mapped agent must have its own identity, OS/CRM agent, Claude session,
 memory, model configuration, permissions, queue, and cancellation scope.
+
+See `docs/CRM_ACP.md`. Maxine is the first isolated pilot.
 
 ## Registering Steve in Buzz
 

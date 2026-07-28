@@ -1,0 +1,9 @@
+{
+  "agent_name": "maxine",
+  "enabled": false,
+  "telegram_enabled": false,
+  "startup_delay": 0,
+  "max_session_seconds": 255600,
+  "working_directory": "/Users/josephsanchez/Documents/OBSIDIAN/Lucky Obsidian/_CC/content/joe/1000months",
+  "crons": []
+}
