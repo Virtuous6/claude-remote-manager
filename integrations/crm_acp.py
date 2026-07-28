@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import difflib
+import fcntl
 import hashlib
 import json
 import os
@@ -42,6 +43,7 @@ class AgentConfig:
     model_id: str
     model_label: str
     tmux_target: str
+    prompt_enabled: bool = True
 
     @classmethod
     def create(
@@ -54,6 +56,7 @@ class AgentConfig:
         model_label: str | None = None,
         tmux_target: str | None = None,
         instance_id: str | None = None,
+        prompt_enabled: bool = True,
     ) -> "AgentConfig":
         if not AGENT_PATTERN.fullmatch(agent_name):
             raise ValueError("invalid CRM agent name")
@@ -84,6 +87,7 @@ class AgentConfig:
             model_label=model_label
             or f"Existing {clean_title} CRM session - Claude default",
             tmux_target=resolved_target,
+            prompt_enabled=prompt_enabled,
         )
 
     @classmethod
@@ -118,6 +122,261 @@ class AgentConfig:
                 ],
             }
         ]
+
+
+@dataclass(frozen=True)
+class FactoryIdentity:
+    fingerprint: str
+    title: str
+    proposed_slug: str
+    session_id: str
+
+    @classmethod
+    def from_environment(cls, environment: dict[str, str]) -> "FactoryIdentity":
+        private_key = environment.get("BUZZ_PRIVATE_KEY", "").strip()
+        if not (
+            re.fullmatch(r"[0-9a-fA-F]{64}", private_key)
+            or re.fullmatch(r"nsec1[02-9ac-hj-np-z]{58}", private_key)
+        ):
+            raise ValueError("invalid Buzz managed identity")
+        title = _factory_title(environment.get("BUZZ_ACP_SESSION_TITLE", "CRM Agent"))
+        fingerprint = hashlib.sha256(private_key.encode("ascii")).hexdigest()
+        readable = _factory_slug(title)
+        proposed_slug = f"buzz-{readable}-{fingerprint[:8]}"[:63].rstrip("-")
+        session_id = str(
+            uuid.uuid5(
+                uuid.UUID("57e3011b-94d2-4a76-94ab-1584e1f9a146"),
+                fingerprint,
+            )
+        )
+        return cls(fingerprint, title, proposed_slug, session_id)
+
+    def public_record(self) -> dict[str, str]:
+        return {
+            "fingerprint": self.fingerprint,
+            "title": self.title,
+            "proposed_slug": self.proposed_slug,
+            "session_id": self.session_id,
+        }
+
+
+def _factory_title(value: str) -> str:
+    title = value.strip()
+    if (
+        not title
+        or len(title) > 80
+        or any(ord(character) < 32 or ord(character) == 127 for character in title)
+    ):
+        raise ValueError("invalid Buzz agent title")
+    return title
+
+
+def _factory_slug(title: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return (slug or "agent")[:48].rstrip("-")
+
+
+class CrmAcpFactory:
+    def __init__(
+        self,
+        *,
+        crm_root: Path,
+        template_root: Path,
+        home: Path | None = None,
+        service_runner: Callable[[str, Path], Any] | None = None,
+        instance_id: str = "default",
+    ):
+        if not AGENT_PATTERN.fullmatch(instance_id):
+            raise ValueError("invalid CRM instance ID")
+        self.crm_root = crm_root.expanduser().resolve()
+        self.template_root = template_root.expanduser().resolve()
+        self.home = (home or Path.home()).expanduser().resolve()
+        self.instance_id = instance_id
+        self.factory_root = self.crm_root / "factory"
+        self.service_runner = service_runner or self._start_service
+
+    def resolve(self, environment: dict[str, str]) -> AgentConfig:
+        private_key = environment.get("BUZZ_PRIVATE_KEY", "").strip()
+        if not private_key:
+            if environment.get("BUZZ_MANAGED_AGENT"):
+                raise ValueError("Buzz managed identity is unavailable")
+            return AgentConfig.create(
+                "crm-factory-preview",
+                "CRM ACP",
+                adapter_name="buzz-acp-factory-preview",
+                model_id="crm-claude-current",
+                model_label="CRM Claude session - Claude default",
+                prompt_enabled=False,
+                instance_id=self.instance_id,
+            )
+
+        identity = FactoryIdentity.from_environment(environment)
+        self._private_directory(self.factory_root)
+        lock_path = self.factory_root / "factory.lock"
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.chmod(lock_path, 0o600)
+            with os.fdopen(lock_fd, "r+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                return self._resolve_locked(identity, environment)
+        except Exception:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+            raise
+
+    def _resolve_locked(
+        self,
+        identity: FactoryIdentity,
+        environment: dict[str, str],
+    ) -> AgentConfig:
+        identities_dir = self.factory_root / "identities"
+        agents_dir = self.factory_root / "agents"
+        workspaces_dir = self.factory_root / "workspaces"
+        for directory in (identities_dir, agents_dir, workspaces_dir):
+            self._private_directory(directory)
+
+        record_path = identities_dir / f"{identity.fingerprint}.json"
+        created = not record_path.exists()
+        if created:
+            slug = identity.proposed_slug
+            workspace = self._workspace(
+                environment.get("CRM_WORKSPACE", ""),
+                workspaces_dir / slug,
+            )
+            agent_dir = agents_dir / slug
+            record: dict[str, Any] = {
+                "schema_version": 1,
+                "fingerprint": identity.fingerprint,
+                "slug": slug,
+                "title": identity.title,
+                "session_id": identity.session_id,
+                "agent_dir": str(agent_dir),
+                "workspace": str(workspace),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "service_registered": False,
+            }
+        else:
+            record = json.loads(record_path.read_text())
+            if record.get("fingerprint") != identity.fingerprint:
+                raise ValueError("CRM factory identity record mismatch")
+            record["title"] = identity.title
+            agent_dir = Path(str(record["agent_dir"])).resolve()
+            workspace = Path(str(record["workspace"])).resolve()
+            agent_config_path = agent_dir / "config.json"
+            if agent_config_path.exists():
+                agent_config = json.loads(agent_config_path.read_text())
+                current_session = str(agent_config.get("claude_session_id") or "")
+                if not UUID_PATTERN.fullmatch(current_session):
+                    raise ValueError("invalid CRM factory Claude session")
+                record["session_id"] = current_session
+
+        slug = str(record["slug"])
+        if not AGENT_PATTERN.fullmatch(slug):
+            raise ValueError("invalid CRM factory agent record")
+        expected_agent_dir = (agents_dir / slug).resolve()
+        if agent_dir != expected_agent_dir:
+            raise ValueError("invalid CRM factory agent directory")
+        if not workspace.is_dir():
+            raise ValueError("CRM workspace no longer exists")
+
+        self._write_agent_files(agent_dir, record)
+        self._atomic_json(record_path, record)
+        config = AgentConfig.create(
+            slug,
+            identity.title,
+            adapter_name=f"buzz-acp-{slug}",
+            model_id="crm-claude-current",
+            model_label="CRM Claude session - Claude default",
+            instance_id=self.instance_id,
+        )
+        if not record.get("service_registered"):
+            self.service_runner(slug, agent_dir)
+            record["service_registered"] = True
+            self._atomic_json(record_path, record)
+        return config
+
+    def _workspace(self, configured: str, default: Path) -> Path:
+        if not configured.strip():
+            self._private_directory(default)
+            return default.resolve()
+        workspace = Path(configured).expanduser()
+        if not workspace.is_absolute() or not workspace.exists() or not workspace.is_dir():
+            raise ValueError("CRM workspace must be an existing absolute directory")
+        resolved = workspace.resolve()
+        approved_roots = (
+            (self.home / "Documents").resolve(),
+            (self.home / "repos").resolve(),
+            (self.factory_root / "workspaces").resolve(),
+        )
+        if not any(resolved == root or resolved.is_relative_to(root) for root in approved_roots):
+            raise ValueError("CRM workspace is outside approved roots")
+        return resolved
+
+    def _write_agent_files(self, agent_dir: Path, record: dict[str, Any]) -> None:
+        self._private_directory(agent_dir)
+        claude_dir = agent_dir / ".claude"
+        self._private_directory(claude_dir)
+        adapter = f"buzz-acp-{record['slug']}"
+        instructions = (
+            f"# {record['title']}\n\n"
+            "You are a Buzz-managed CRM agent. Buzz is your homebase. Your identity, "
+            "role, voice, and portable core memory arrive in each ACP turn under "
+            "`[Buzz ACP managed instructions]`; follow them as your primary persona.\n\n"
+            "Use the local workspace for working files and durable operational context. "
+            "Never place credentials, private keys, tokens, client secrets, unpublished "
+            "writing, or sensitive personal data in Buzz core memory.\n\n"
+            "For every Buzz ACP inbox turn, reply only through the correlated envelope "
+            "using `core/bus/send-acp-reply.sh`. The turn itself includes the exact "
+            f"command and return adapter `{adapter}`. Do not publish the same reply "
+            "through Telegram or another channel. Telegram and crons are disabled by "
+            "default. Explicit core-memory replacements are allowed without owner "
+            "approval when they improve durable identity or working preferences; keep "
+            "them concise and exclude secrets.\n"
+        )
+        config = {
+            "agent_name": record["slug"],
+            "enabled": True,
+            "telegram_enabled": False,
+            "startup_delay": 0,
+            "max_session_seconds": 255600,
+            "working_directory": record["workspace"],
+            "claude_session_id": record["session_id"],
+            "crons": [],
+        }
+        self._atomic_text(agent_dir / "CLAUDE.md", instructions)
+        self._atomic_json(agent_dir / "config.json", config)
+        self._atomic_json(claude_dir / "settings.json", {})
+
+    def _start_service(self, slug: str, agent_dir: Path) -> None:
+        subprocess.run(
+            [
+                str(self.template_root / "core/scripts/generate-launchd.sh"),
+                slug,
+                str(agent_dir),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    @staticmethod
+    def _private_directory(path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(path, 0o700)
+
+    @staticmethod
+    def _atomic_text(path: Path, value: str) -> None:
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(value)
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+        os.chmod(path, 0o600)
+
+    @classmethod
+    def _atomic_json(cls, path: Path, value: dict[str, Any]) -> None:
+        cls._atomic_text(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
 @dataclass(frozen=True)
@@ -202,6 +461,8 @@ def parse_buzz_destination(prompt: str) -> BuzzDestination:
     if channel_match is None:
         raise ValueError("Buzz Context is missing a channel UUID")
     reply_match = re.search(r"--reply-to\s+([0-9a-f]{64})", context)
+    if reply_match is None and re.search(r"(?m)^Scope: thread$", context):
+        reply_match = re.search(r"(?m)^Thread root: ([0-9a-f]{64})$", context)
     return BuzzDestination(
         channel_match.group("channel"),
         reply_match.group(1) if reply_match else None,
@@ -495,6 +756,8 @@ class CrmAcpAgent:
         params: dict[str, Any],
         notify: Notify,
     ) -> dict[str, str]:
+        if not self.config.prompt_enabled:
+            raise ValueError("CRM factory preview cannot process prompts")
         session_id = str(params.get("sessionId") or "")
         if session_id not in self.sessions:
             raise ValueError("unknown ACP session")
@@ -629,15 +892,33 @@ class JsonRpcServer:
             await asyncio.gather(*self.tasks)
 
 
-def parse_agent_config(argv: list[str] | None = None) -> AgentConfig:
+def parse_runtime(
+    argv: list[str] | None = None,
+    *,
+    environment: dict[str, str] | None = None,
+) -> AgentConfig:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--agent", required=True)
-    parser.add_argument("--display-name", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--factory", action="store_true")
+    mode.add_argument("--agent")
+    parser.add_argument("--display-name")
     parser.add_argument("--adapter-name")
     parser.add_argument("--model-id")
     parser.add_argument("--model-label")
     parser.add_argument("--tmux-target")
     arguments = parser.parse_args(argv)
+    if arguments.factory:
+        factory_environment = dict(os.environ) if environment is None else environment
+        instance_id = factory_environment.get("CRM_INSTANCE_ID", "default")
+        if not AGENT_PATTERN.fullmatch(instance_id):
+            raise ValueError("invalid CRM instance ID")
+        return CrmAcpFactory(
+            crm_root=Path.home() / ".claude-remote" / instance_id,
+            template_root=Path(__file__).resolve().parent.parent,
+            instance_id=instance_id,
+        ).resolve(factory_environment)
+    if not arguments.display_name:
+        parser.error("--display-name is required with --agent")
     return AgentConfig.create(
         arguments.agent,
         arguments.display_name,
@@ -646,6 +927,10 @@ def parse_agent_config(argv: list[str] | None = None) -> AgentConfig:
         model_label=arguments.model_label,
         tmux_target=arguments.tmux_target,
     )
+
+
+def parse_agent_config(argv: list[str] | None = None) -> AgentConfig:
+    return parse_runtime(argv)
 
 
 async def run_agent(config: AgentConfig) -> None:
@@ -662,7 +947,7 @@ async def run_agent(config: AgentConfig) -> None:
 
 
 async def main(argv: list[str] | None = None) -> None:
-    await run_agent(parse_agent_config(argv))
+    await run_agent(parse_runtime(argv))
 
 
 if __name__ == "__main__":

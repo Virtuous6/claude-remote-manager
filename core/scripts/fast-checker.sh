@@ -450,7 +450,7 @@ while true; do
         if [[ "$SHOULD_RESTART" == "true" ]]; then
             log "CONTEXT_THRESHOLD: ${RESTART_REASON} — triggering hard-restart"
             CONTEXT_RESTART_TRIGGERED=true
-            inject_messages "SYSTEM: Context threshold reached (${RESTART_REASON}). Before restarting: 1) Write a handoff file to ${CRM_ROOT}/state/${AGENT}.handoff.md with current tasks, briefings sent today, open threads, and in-progress work. 2) Notify Josh via Telegram you're restarting. 3) Run: bash ../../core/bus/hard-restart.sh --reason '${RESTART_REASON}'"
+            inject_messages "SYSTEM: Context threshold reached (${RESTART_REASON}). Before restarting: 1) Write a handoff file to ${CRM_ROOT}/state/${AGENT}.handoff.md with current tasks, briefings sent today, open threads, and in-progress work. 2) Notify the owner through an enabled channel. 3) Run: bash '${BUS_DIR}/hard-restart.sh' --reason '${RESTART_REASON}'"
             rm -f "${SESSION_START_FILE}"
             # Safety net: if Claude doesn't self-restart within 3 min, force it
             ( sleep 180; if [[ "$CONTEXT_RESTART_TRIGGERED" == "true" ]]; then

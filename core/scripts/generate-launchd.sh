@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # generate-launchd.sh - Generate and load a launchd plist for an agent
-# Usage: generate-launchd.sh <agent_name>
+# Usage: generate-launchd.sh <agent_name> [<agent_dir>]
 
 set -euo pipefail
 
 AGENT="$1"
+if [[ ! "${AGENT}" =~ ^[a-z0-9][a-z0-9-]{0,62}$ ]]; then
+    echo "ERROR: invalid agent name" >&2
+    exit 1
+fi
 TEMPLATE_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
-AGENT_DIR="${TEMPLATE_ROOT}/agents/${AGENT}"
+AGENT_DIR="${2:-${TEMPLATE_ROOT}/agents/${AGENT}}"
+AGENT_DIR="$(cd "${AGENT_DIR}" && pwd -P)"
 CONFIG_FILE="${AGENT_DIR}/config.json"
 
 # Load instance ID from repo .env
@@ -24,6 +29,7 @@ LOG_DIR="${CRM_ROOT}/logs/${AGENT}"
 WRAPPER="${TEMPLATE_ROOT}/core/scripts/agent-wrapper.sh"
 
 mkdir -p "${PLIST_DIR}" "${LOG_DIR}"
+chmod 700 "${LOG_DIR}"
 
 # Auto-detect PATH: find where claude, jq, and python3 live
 CLAUDE_BIN=$(which claude 2>/dev/null || echo "")
@@ -64,6 +70,7 @@ cat > "${PLIST_FILE}" <<ENDPLIST
         <string>${WRAPPER}</string>
         <string>${AGENT}</string>
         <string>${TEMPLATE_ROOT}</string>
+        <string>${AGENT_DIR}</string>
     </array>
 
     <key>KeepAlive</key>
@@ -89,6 +96,8 @@ cat > "${PLIST_FILE}" <<ENDPLIST
         <string>${CRM_ROOT}</string>
         <key>CRM_TEMPLATE_ROOT</key>
         <string>${TEMPLATE_ROOT}</string>
+        <key>CRM_AGENT_DIR</key>
+        <string>${AGENT_DIR}</string>
     </dict>
 
     <key>WorkingDirectory</key>

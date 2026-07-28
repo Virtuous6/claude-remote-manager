@@ -13,7 +13,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 TEMPLATE_ROOT="${CRM_TEMPLATE_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd -P)}"
 AGENT="${CRM_AGENT_NAME:-$(basename "$(pwd)")}"
-AGENT_DIR="${TEMPLATE_ROOT}/agents/${AGENT}"
+AGENT_DIR="${CRM_AGENT_DIR:-${TEMPLATE_ROOT}/agents/${AGENT}}"
+AGENT_DIR="$(cd "${AGENT_DIR}" && pwd -P)"
 
 # Load instance ID
 REPO_ENV="${TEMPLATE_ROOT}/.env"
@@ -39,6 +40,11 @@ fi
 
 # Model flag
 MODEL=$(jq -r '.model // empty' "${AGENT_DIR}/config.json" 2>/dev/null || echo "")
+CLAUDE_SESSION_ID=$(jq -r '.claude_session_id // empty' "${AGENT_DIR}/config.json" 2>/dev/null || echo "")
+if [[ -n "${CLAUDE_SESSION_ID}" && ! "${CLAUDE_SESSION_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    echo "ERROR: invalid claude_session_id" >&2
+    exit 1
+fi
 
 LAUNCH_DIR="${AGENT_DIR}"
 EXTRA_FLAGS=()
@@ -101,7 +107,12 @@ printf '%s' "${CONTINUE_PROMPT}" > "${PROMPT_FILE}"
     printf 'export CRM_INSTANCE_ID=%q\n' "${CRM_INSTANCE_ID}"
     printf 'export CRM_ROOT=%q\n' "${CRM_ROOT}"
     printf 'export CRM_TEMPLATE_ROOT=%q\n' "${TEMPLATE_ROOT}"
-    printf 'ARGS=(--continue --dangerously-skip-permissions)\n'
+    printf 'export CRM_AGENT_DIR=%q\n' "${AGENT_DIR}"
+    if [[ -n "${CLAUDE_SESSION_ID}" ]]; then
+        printf 'ARGS=(--resume %q --dangerously-skip-permissions)\n' "${CLAUDE_SESSION_ID}"
+    else
+        printf 'ARGS=(--continue --dangerously-skip-permissions)\n'
+    fi
     if [[ -n "${MODEL}" ]]; then
         printf 'ARGS+=(--model %q)\n' "${MODEL}"
     fi
@@ -163,4 +174,4 @@ tmux kill-session -t "${RESTART_TMUX_SESSION}" 2>/dev/null || true
 tmux new-session -d -s "${RESTART_TMUX_SESSION}" \
     "bash $(printf '%q' "${RESTART_RUNNER}") >> $(printf '%q' "${LOG_DIR}/restarts.log") 2>&1"
 
-echo "CLI restart with --continue scheduled for ${AGENT} in ~5 seconds. Conversation will be preserved."
+echo "CLI session resume scheduled for ${AGENT} in ~5 seconds. Conversation will be preserved."
