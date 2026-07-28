@@ -356,7 +356,10 @@ class CrmAcpFactory:
             "or five-field `cron` plus `timezone: UTC`. Buzz calendar cron is UTC. "
             "Tasks may not contain @ mentions. Other actions are `list`, `pause`, "
             "`resume`, `delete`, and `run_now`; mutations use the local schedule name. "
-            "The adapter—not this Claude session—uses the managed Buzz identity.\n"
+            "The adapter—not this Claude session—uses the managed Buzz identity. "
+            "Your Buzz response policy must allowlist only the pinned community relay "
+            "so relay-signed schedule posts reach CRM; the owner and verified "
+            "same-owner agents remain implicitly accepted.\n"
         )
         config = {
             "agent_name": record["slug"],

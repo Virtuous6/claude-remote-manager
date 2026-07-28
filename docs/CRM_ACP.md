@@ -99,8 +99,9 @@ existing agents. Do not use them for new roles.
 5. Leave its fixed CRM model selected.
 6. Optional: under Advanced, set `CRM_WORKSPACE` to an existing absolute
    directory under `~/Documents` or `~/repos`.
-7. Under Advanced, set the Buzz response policy to **Anyone**. CRM applies the
-   narrower owner/sibling/attributed-workflow gate described below.
+7. Under Advanced, set the Buzz response policy to **Allowlist** and add the
+   pinned `Buzz Relay Service` pubkey from the harness. The owner and
+   same-owner agents remain implicitly accepted.
 8. Create the agent and add it to its channels.
 
 On first spawn, the factory automatically creates:
@@ -200,11 +201,13 @@ renamed, adapter startup reconciles every recorded workflow to the new exact
 display name.
 
 Security requirement: set the managed agent's Buzz response policy to
-`anyone`. This is a transport setting, not the effective CRM policy. Buzz
-Workflow messages are signed by the community relay, so Buzz ACP's default
-`owner-only` gate drops them before the custom harness can inspect them.
+`allowlist` and add only the pinned community relay pubkey. Buzz Workflow
+messages are signed by the community relay, so Buzz ACP's default `owner-only`
+gate drops them before the custom harness can inspect them. Buzz implicitly
+retains the owner and cryptographically verified same-owner agents in
+`allowlist` mode.
 
-CRM immediately narrows the `anyone` transport back to:
+CRM independently verifies every accepted turn as:
 
 - the cryptographically attested owner;
 - agents carrying a valid NIP-OA attestation for that same owner;
@@ -230,8 +233,9 @@ Current limits:
   not configurable in CRM yet.
 - A workflow stays bound to its original channel. Updating it elsewhere changes
   the task or schedule, not the destination.
-- A new managed agent starts `owner-only`; switch it to `anyone` after selecting
-  CRM ACP or its workflow posts will remain visible but will not wake the agent.
+- A new managed agent starts `owner-only`; switch it to the one-key relay
+  allowlist after selecting CRM ACP or its workflow posts will remain visible
+  but will not wake the agent.
 
 ### Local CRM Crons
 
