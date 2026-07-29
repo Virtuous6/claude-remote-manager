@@ -12,11 +12,12 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
@@ -47,6 +48,325 @@ class TurnCancelled(Exception):
     """Raised when Buzz cancels the active ACP turn."""
 
 
+def _validate_claude_model(value: Any) -> str:
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/\-\[\]]{0,199}", value)
+    ):
+        raise ValueError("invalid Claude model")
+    return value
+
+
+@dataclass(frozen=True)
+class ClaudeModelOption:
+    value: str
+    name: str
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        _validate_claude_model(self.value)
+        if (
+            not self.name.strip()
+            or len(self.name) > 120
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in self.name
+            )
+            or len(self.description) > 500
+            or any(
+                (ord(character) < 32 and character not in "\n\t")
+                or ord(character) == 127
+                for character in self.description
+            )
+        ):
+            raise ValueError("invalid Claude model metadata")
+
+    def acp_option(self) -> dict[str, str]:
+        option = {
+            "value": self.value,
+            "name": self.name.strip(),
+            "displayName": self.name.strip(),
+        }
+        if self.description:
+            option["description"] = self.description
+        return option
+
+
+@dataclass(frozen=True)
+class ClaudeModelCatalog:
+    current: str
+    options: tuple[ClaudeModelOption, ...]
+
+    def __post_init__(self) -> None:
+        _validate_claude_model(self.current)
+        if not self.options or len(self.options) > 64:
+            raise ValueError("invalid Claude model catalog")
+        values = [option.value for option in self.options]
+        if len(set(values)) != len(values) or self.current not in values:
+            raise ValueError("invalid Claude model catalog")
+
+    @classmethod
+    def fallback(cls) -> "ClaudeModelCatalog":
+        return cls(
+            "default",
+            (
+                ClaudeModelOption(
+                    "default",
+                    "Default (recommended)",
+                    "Use Claude Code's current default model.",
+                ),
+            ),
+        )
+
+    @classmethod
+    def from_buzz_models(cls, payload: Any) -> "ClaudeModelCatalog":
+        if not isinstance(payload, dict):
+            raise ValueError("invalid Claude model catalog")
+        stable = payload.get("stable")
+        configs = stable.get("configOptions") if isinstance(stable, dict) else None
+        if not isinstance(configs, list):
+            raise ValueError("invalid Claude model catalog")
+        model_config = next(
+            (
+                config
+                for config in configs
+                if isinstance(config, dict)
+                and (
+                    config.get("category") == "model"
+                    or config.get("id") == "model"
+                    or config.get("configId") == "model"
+                )
+            ),
+            None,
+        )
+        if not isinstance(model_config, dict):
+            raise ValueError("invalid Claude model catalog")
+        raw_options = model_config.get("options")
+        current = model_config.get("currentValue")
+        if not isinstance(raw_options, list) or not isinstance(current, str):
+            raise ValueError("invalid Claude model catalog")
+        options: list[ClaudeModelOption] = []
+        for raw in raw_options:
+            if not isinstance(raw, dict):
+                raise ValueError("invalid Claude model catalog")
+            value = raw.get("value")
+            name = raw.get("displayName") or raw.get("name") or value
+            description = raw.get("description") or ""
+            if not all(isinstance(item, str) for item in (value, name, description)):
+                raise ValueError("invalid Claude model catalog")
+            options.append(ClaudeModelOption(value, name, description))
+        return cls(current, tuple(options))
+
+    @classmethod
+    def discover(
+        cls,
+        *,
+        buzz_acp: Path,
+        claude_acp: Path,
+        runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+        environment: dict[str, str] | None = None,
+    ) -> "ClaudeModelCatalog":
+        source = dict(os.environ) if environment is None else environment
+        child_env = {
+            key: source[key]
+            for key in (
+                "HOME",
+                "PATH",
+                "TMPDIR",
+                "USER",
+                "LOGNAME",
+                "LANG",
+                "LC_ALL",
+                "SHELL",
+                "CLAUDE_CODE_EXECUTABLE",
+            )
+            if source.get(key)
+        }
+        child_env["BUZZ_ACP_AGENT_COMMAND"] = str(claude_acp)
+        completed = runner(
+            [str(buzz_acp), "models", "--json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=child_env,
+            cwd=source.get("HOME") or None,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("Claude model discovery failed")
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            raise ValueError("invalid Claude model catalog") from None
+        return cls.from_buzz_models(payload)
+
+    def label_for(self, value: str) -> str:
+        for option in self.options:
+            if option.value == value:
+                return option.name
+        return value
+
+    def with_current(self, value: str) -> "ClaudeModelCatalog":
+        clean = _validate_claude_model(value)
+        if any(option.value == clean for option in self.options):
+            return replace(self, current=clean)
+        return ClaudeModelCatalog(
+            clean,
+            self.options + (ClaudeModelOption(clean, clean, "Custom Claude model."),),
+        )
+
+
+class CrmModelManager:
+    def __init__(
+        self,
+        config_path: Path,
+        *,
+        reload_model: Callable[[str], None],
+    ):
+        self.config_path = config_path
+        self.reload_model = reload_model
+
+    def apply(self, value: str) -> None:
+        clean = _validate_claude_model(value)
+        if self.config_path.is_symlink() or not self.config_path.is_file():
+            raise ValueError("invalid CRM model config")
+        if self.config_path.stat().st_size > 65_536:
+            raise ValueError("invalid CRM model config")
+        try:
+            config = json.loads(self.config_path.read_text())
+        except json.JSONDecodeError:
+            raise ValueError("invalid CRM model config") from None
+        if not isinstance(config, dict):
+            raise ValueError("invalid CRM model config")
+        if config.get("model") == clean:
+            return
+        original = dict(config)
+        config["model"] = clean
+        self._atomic_write(config)
+        try:
+            self.reload_model(clean)
+        except Exception:
+            self._atomic_write(original)
+            raise
+
+    def _atomic_write(self, config: dict[str, Any]) -> None:
+        temporary = self.config_path.with_name(
+            f".{self.config_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "w") as output:
+                output.write(json.dumps(config, indent=2, sort_keys=True) + "\n")
+            temporary.replace(self.config_path)
+            os.chmod(self.config_path, 0o600)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _reload_factory_model(
+    config: "AgentConfig",
+    config_path: Path,
+    value: str,
+    *,
+    crm_root: Path,
+    template_root: Path,
+    runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
+    environment: dict[str, str] | None = None,
+) -> None:
+    session = config.tmux_target.split(":", 1)[0]
+    probe = runner(
+        ["tmux", "has-session", "-t", session],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        return
+    source = dict(os.environ) if environment is None else environment
+    child_env = {
+        key: source[key]
+        for key in ("HOME", "PATH", "TMPDIR", "USER", "LOGNAME", "LANG", "SHELL")
+        if source.get(key)
+    }
+    child_env.update(
+        {
+            "CRM_AGENT_NAME": config.agent_name,
+            "CRM_INSTANCE_ID": crm_root.name,
+            "CRM_ROOT": str(crm_root),
+            "CRM_TEMPLATE_ROOT": str(template_root),
+            "CRM_AGENT_DIR": str(config_path.parent),
+        }
+    )
+    runner(
+        [
+            "bash",
+            str(template_root / "core/bus/self-restart.sh"),
+            "--reason",
+            f"Buzz selected Claude model {value}",
+            "--quiet",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=child_env,
+    )
+
+
+def discover_claude_model_catalog(
+    environment: dict[str, str] | None = None,
+) -> ClaudeModelCatalog:
+    source = dict(os.environ) if environment is None else environment
+    if source.get("CRM_CLAUDE_MODEL_DISCOVERY") == "disabled":
+        return ClaudeModelCatalog.fallback()
+    home = Path(source.get("HOME") or Path.home()).expanduser()
+    buzz_candidates = (
+        shutil.which("buzz-acp", path=source.get("PATH")),
+        str(home / "Applications/Buzz.app/Contents/MacOS/buzz-acp"),
+        "/Applications/Buzz.app/Contents/MacOS/buzz-acp",
+    )
+    claude_candidates = (
+        shutil.which("claude-agent-acp", path=source.get("PATH")),
+        str(
+            home
+            / "Library/Application Support/Buzz/node-tools/bin/claude-agent-acp"
+        ),
+        str(home / ".local/share/Buzz/node-tools/bin/claude-agent-acp"),
+    )
+    buzz_acp = next(
+        (
+            Path(candidate)
+            for candidate in buzz_candidates
+            if candidate and Path(candidate).is_file()
+        ),
+        None,
+    )
+    claude_acp = next(
+        (
+            Path(candidate)
+            for candidate in claude_candidates
+            if candidate and Path(candidate).is_file()
+        ),
+        None,
+    )
+    if buzz_acp is None or claude_acp is None:
+        return ClaudeModelCatalog.fallback()
+    try:
+        return ClaudeModelCatalog.discover(
+            buzz_acp=buzz_acp,
+            claude_acp=claude_acp,
+            environment=source,
+        )
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError):
+        return ClaudeModelCatalog.fallback()
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     agent_name: str
@@ -56,6 +376,8 @@ class AgentConfig:
     model_label: str
     tmux_target: str
     prompt_enabled: bool = True
+    model_options: tuple[ClaudeModelOption, ...] = ()
+    allow_custom_model: bool = False
 
     @classmethod
     def create(
@@ -69,6 +391,8 @@ class AgentConfig:
         tmux_target: str | None = None,
         instance_id: str | None = None,
         prompt_enabled: bool = True,
+        model_options: tuple[ClaudeModelOption, ...] = (),
+        allow_custom_model: bool = False,
     ) -> "AgentConfig":
         if not AGENT_PATTERN.fullmatch(agent_name):
             raise ValueError("invalid CRM agent name")
@@ -83,7 +407,25 @@ class AgentConfig:
         if not ADAPTER_PATTERN.fullmatch(resolved_adapter):
             raise ValueError("invalid CRM ACP adapter name")
         resolved_model = model_id or f"crm-{agent_name}-current"
-        if not re.fullmatch(r"^crm-[a-z0-9-]+-current$", resolved_model):
+        if not (
+            re.fullmatch(r"^crm-[a-z0-9-]+-current$", resolved_model)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:/\-\[\]]{0,199}",
+                resolved_model,
+            )
+        ):
+            raise ValueError("invalid CRM model ID")
+        resolved_label = (
+            model_label
+            or f"Existing {clean_title} CRM session - Claude default"
+        )
+        resolved_options = model_options or (
+            ClaudeModelOption(resolved_model, resolved_label),
+        )
+        if (
+            not allow_custom_model
+            and resolved_model not in {option.value for option in resolved_options}
+        ):
             raise ValueError("invalid CRM model ID")
         resolved_instance = instance_id or os.environ.get("CRM_INSTANCE_ID", "default")
         if not AGENT_PATTERN.fullmatch(resolved_instance):
@@ -96,10 +438,11 @@ class AgentConfig:
             title=clean_title,
             adapter_name=resolved_adapter,
             model_id=resolved_model,
-            model_label=model_label
-            or f"Existing {clean_title} CRM session - Claude default",
+            model_label=resolved_label,
             tmux_target=resolved_target,
             prompt_enabled=prompt_enabled,
+            model_options=resolved_options,
+            allow_custom_model=allow_custom_model,
         )
 
     @classmethod
@@ -125,15 +468,28 @@ class AgentConfig:
                 "category": "model",
                 "type": "select",
                 "currentValue": self.model_id,
-                "options": [
-                    {
-                        "value": self.model_id,
-                        "name": self.model_label,
-                        "displayName": self.model_label,
-                    }
-                ],
+                "options": [option.acp_option() for option in self.model_options],
             }
         ]
+
+    def select_model(self, value: str) -> "AgentConfig":
+        clean = _validate_claude_model(value)
+        known = next(
+            (option for option in self.model_options if option.value == clean),
+            None,
+        )
+        if known is None and not self.allow_custom_model:
+            raise ValueError(f"{self.title} ACP supports only its fixed model")
+        options = self.model_options
+        if known is None:
+            known = ClaudeModelOption(clean, clean, "Custom Claude model.")
+            options += (known,)
+        return replace(
+            self,
+            model_id=clean,
+            model_label=known.name,
+            model_options=options,
+        )
 
 
 @dataclass(frozen=True)
@@ -196,6 +552,7 @@ class CrmAcpFactory:
         template_root: Path,
         home: Path | None = None,
         service_runner: Callable[[str, Path], Any] | None = None,
+        model_catalog: Callable[[dict[str, str]], ClaudeModelCatalog] | None = None,
         instance_id: str = "default",
     ):
         if not AGENT_PATTERN.fullmatch(instance_id):
@@ -206,23 +563,28 @@ class CrmAcpFactory:
         self.instance_id = instance_id
         self.factory_root = self.crm_root / "factory"
         self.service_runner = service_runner or self._start_service
+        self.model_catalog = model_catalog or discover_claude_model_catalog
 
     def resolve(self, environment: dict[str, str]) -> AgentConfig:
         private_key = environment.get("BUZZ_PRIVATE_KEY", "").strip()
         if not private_key:
             if environment.get("BUZZ_MANAGED_AGENT"):
                 raise ValueError("Buzz managed identity is unavailable")
+            catalog = self.model_catalog(environment)
             return AgentConfig.create(
                 "crm-factory-preview",
                 "CRM ACP",
                 adapter_name="buzz-acp-factory-preview",
-                model_id="crm-claude-current",
-                model_label="CRM Claude session - Claude default",
+                model_id=catalog.current,
+                model_label=catalog.label_for(catalog.current),
                 prompt_enabled=False,
+                model_options=catalog.options,
+                allow_custom_model=True,
                 instance_id=self.instance_id,
             )
 
         identity = FactoryIdentity.from_environment(environment)
+        catalog = self.model_catalog(environment)
         self._private_directory(self.factory_root)
         lock_path = self.factory_root / "factory.lock"
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -230,7 +592,7 @@ class CrmAcpFactory:
             os.chmod(lock_path, 0o600)
             with os.fdopen(lock_fd, "r+") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
-                return self._resolve_locked(identity, environment)
+                return self._resolve_locked(identity, environment, catalog)
         except Exception:
             try:
                 os.close(lock_fd)
@@ -242,6 +604,7 @@ class CrmAcpFactory:
         self,
         identity: FactoryIdentity,
         environment: dict[str, str],
+        catalog: ClaudeModelCatalog,
     ) -> AgentConfig:
         identities_dir = self.factory_root / "identities"
         agents_dir = self.factory_root / "agents"
@@ -269,6 +632,7 @@ class CrmAcpFactory:
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "service_registered": False,
             }
+            selected_model = catalog.current
         else:
             record = json.loads(record_path.read_text())
             if record.get("fingerprint") != identity.fingerprint:
@@ -283,6 +647,11 @@ class CrmAcpFactory:
                 if not UUID_PATTERN.fullmatch(current_session):
                     raise ValueError("invalid CRM factory Claude session")
                 record["session_id"] = current_session
+                selected_model = _validate_claude_model(
+                    agent_config.get("model", catalog.current)
+                )
+            else:
+                selected_model = catalog.current
 
         slug = str(record["slug"])
         if not AGENT_PATTERN.fullmatch(slug):
@@ -293,14 +662,17 @@ class CrmAcpFactory:
         if not workspace.is_dir():
             raise ValueError("CRM workspace no longer exists")
 
-        self._write_agent_files(agent_dir, record)
+        selected_catalog = catalog.with_current(selected_model)
+        self._write_agent_files(agent_dir, record, selected_model)
         self._atomic_json(record_path, record)
         config = AgentConfig.create(
             slug,
             identity.title,
             adapter_name=f"buzz-acp-{slug}",
-            model_id="crm-claude-current",
-            model_label="CRM Claude session - Claude default",
+            model_id=selected_model,
+            model_label=selected_catalog.label_for(selected_model),
+            model_options=selected_catalog.options,
+            allow_custom_model=True,
             instance_id=self.instance_id,
         )
         if not record.get("service_registered"):
@@ -326,7 +698,12 @@ class CrmAcpFactory:
             raise ValueError("CRM workspace is outside approved roots")
         return resolved
 
-    def _write_agent_files(self, agent_dir: Path, record: dict[str, Any]) -> None:
+    def _write_agent_files(
+        self,
+        agent_dir: Path,
+        record: dict[str, Any],
+        selected_model: str,
+    ) -> None:
         self._private_directory(agent_dir)
         claude_dir = agent_dir / ".claude"
         self._private_directory(claude_dir)
@@ -367,10 +744,11 @@ class CrmAcpFactory:
             "agent_name": record["slug"],
             "enabled": True,
             "telegram_enabled": False,
-            "startup_delay": 0,
+            "startup_delay": 5,
             "max_session_seconds": 255600,
             "working_directory": record["workspace"],
             "claude_session_id": record["session_id"],
+            "model": selected_model,
             "crons": [],
         }
         self._atomic_text(agent_dir / "CLAUDE.md", instructions)
@@ -1521,6 +1899,7 @@ class CrmAcpAgent:
         memory: BuzzMemoryWriter,
         workflows: BuzzWorkflowManager | None = None,
         authorizer: BuzzTurnAuthorizer | None = None,
+        model_manager: CrmModelManager | None = None,
         *,
         reply_timeout: float = 600,
     ):
@@ -1530,6 +1909,7 @@ class CrmAcpAgent:
         self.memory = memory
         self.workflows = workflows
         self.authorizer = authorizer or BuzzTurnAuthorizer()
+        self.model_manager = model_manager
         self.reply_timeout = reply_timeout
         self.sessions: dict[str, dict[str, Any]] = {}
         self.cancel_events: dict[str, asyncio.Event] = {}
@@ -1583,8 +1963,17 @@ class CrmAcpAgent:
         value: Any = params.get("value")
         if isinstance(value, dict):
             value = value.get("value")
-        if config_id != "model" or value != self.config.model_id:
-            raise ValueError(f"{self.config.title} ACP supports only its fixed model")
+        if config_id != "model":
+            raise ValueError("unsupported CRM ACP configuration")
+        selected = self.config.select_model(value)
+        if self.model_manager is None:
+            if selected.model_id != self.config.model_id:
+                raise ValueError(
+                    f"{self.config.title} ACP supports only its fixed model"
+                )
+        else:
+            self.model_manager.apply(selected.model_id)
+        self.config = selected
         return {"configOptions": self.config.model_config()}
 
     async def prompt(
@@ -1784,6 +2173,26 @@ async def run_agent(config: AgentConfig) -> None:
     timeout = float(os.environ.get("CRM_ACP_REPLY_TIMEOUT", "600"))
     crm_root = default_crm_root()
     bus = CrmBus(crm_root, config=config)
+    model_manager: CrmModelManager | None = None
+    if config.allow_custom_model and config.prompt_enabled:
+        template_root = Path(__file__).resolve().parent.parent
+        model_config_path = (
+            crm_root
+            / "factory"
+            / "agents"
+            / config.agent_name
+            / "config.json"
+        )
+        model_manager = CrmModelManager(
+            model_config_path,
+            reload_model=lambda value: _reload_factory_model(
+                config,
+                model_config_path,
+                value,
+                crm_root=crm_root,
+                template_root=template_root,
+            ),
+        )
     if config.prompt_enabled:
         workflows: BuzzWorkflowManager | None = BuzzWorkflowManager(config, crm_root)
         workflows.reconcile_title()
@@ -1798,6 +2207,7 @@ async def run_agent(config: AgentConfig) -> None:
         BuzzMemoryWriter(),
         workflows,
         authorizer,
+        model_manager,
         reply_timeout=timeout,
     )
     await JsonRpcServer(agent).run()

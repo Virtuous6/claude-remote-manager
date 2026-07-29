@@ -45,7 +45,7 @@ mkdir -p "${TEMPLATE_ROOT}" "${AGENT_DIR}" "${LOG_DIR}" "${TMP}/bin"
 AGENT_DIR="$(cd "${AGENT_DIR}" && pwd -P)"
 printf 'CRM_INSTANCE_ID=%s\n' "${INSTANCE}" > "${TEMPLATE_ROOT}/.env"
 printf '# Factory test\n' > "${AGENT_DIR}/CLAUDE.md"
-printf '{"claude_session_id":"%s"}\n' "${SESSION_ID}" > "${AGENT_DIR}/config.json"
+printf '{"claude_session_id":"%s","model":"opus[1m]"}\n' "${SESSION_ID}" > "${AGENT_DIR}/config.json"
 printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> "%s"\n' \
     "${TMP}/claude-args.log" > "${TMP}/bin/claude"
 chmod +x "${TMP}/bin/claude"
@@ -57,12 +57,17 @@ CRM_TEMPLATE_ROOT="${TEMPLATE_ROOT}" \
 CRM_AGENT_NAME="${AGENT}" \
 CRM_AGENT_DIR="${AGENT_DIR}" \
 CRM_ROOT="${CRM_ROOT}" \
-    bash "${ROOT}/core/bus/self-restart.sh" --reason "factory test"
+    bash "${ROOT}/core/bus/self-restart.sh" --reason "factory test" --quiet
 
 CONTINUE_LAUNCHER="${LOG_DIR}/.continue.sh"
 [[ -f "${CONTINUE_LAUNCHER}" ]] || fail "continue launcher not generated"
 assert_contains "${CONTINUE_LAUNCHER}" "export CRM_AGENT_DIR=${AGENT_DIR}"
 assert_contains "${CONTINUE_LAUNCHER}" "--resume ${SESSION_ID} --dangerously-skip-permissions"
+assert_contains "${CONTINUE_LAUNCHER}" "--model opus\\[1m\\]"
+
+if grep -Fq "send a Telegram message" "${LOG_DIR}/.continue-prompt"; then
+    fail "quiet model restart requested a Telegram notification"
+fi
 
 for _ in 1 2 3 4 5 6 7 8 9 10; do
     [[ -f "${TMP}/claude-args.log" ]] && break
@@ -70,5 +75,6 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 [[ -f "${TMP}/claude-args.log" ]] || fail "restart runner did not relaunch claude"
 assert_contains "${TMP}/claude-args.log" "--resume ${SESSION_ID} --dangerously-skip-permissions"
+assert_contains "${TMP}/claude-args.log" "--model opus[1m]"
 
 echo "PASS: factory restart flow"

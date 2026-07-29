@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest.mock import Mock
 
 from integrations.crm_acp import (
+    ClaudeModelCatalog,
+    ClaudeModelOption,
     CrmAcpFactory,
     FactoryIdentity,
     parse_runtime,
@@ -19,6 +21,14 @@ from integrations.crm_acp import (
 
 PRIVATE_KEY_A = "1" * 64
 PRIVATE_KEY_B = "2" * 64
+TEST_CATALOG = ClaudeModelCatalog(
+    "claude-fable-5[1m]",
+    (
+        ClaudeModelOption("default", "Default"),
+        ClaudeModelOption("claude-fable-5[1m]", "Fable"),
+        ClaudeModelOption("sonnet", "Sonnet"),
+    ),
+)
 
 
 class FactoryIdentityTest(unittest.TestCase):
@@ -84,6 +94,7 @@ class CrmAcpFactoryTest(unittest.TestCase):
             template_root=Path.cwd(),
             home=home,
             service_runner=service or Mock(),
+            model_catalog=lambda _environment: TEST_CATALOG,
         )
 
     def test_preview_has_model_without_provisioning(self):
@@ -93,7 +104,8 @@ class CrmAcpFactoryTest(unittest.TestCase):
 
             config = factory.resolve({})
 
-            self.assertEqual(config.model_id, "crm-claude-current")
+            self.assertEqual(config.model_id, "claude-fable-5[1m]")
+            self.assertEqual(len(config.model_options), 3)
             self.assertFalse(config.prompt_enabled)
             self.assertFalse((root / "crm/factory").exists())
 
@@ -120,7 +132,7 @@ class CrmAcpFactoryTest(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertTrue(first.prompt_enabled)
             self.assertTrue(first.agent_name.startswith("buzz-maxine-"))
-            self.assertEqual(first.model_id, "crm-claude-current")
+            self.assertEqual(first.model_id, "claude-fable-5[1m]")
             self.assertEqual(service.call_count, 1)
 
             identities = list((root / "crm/factory/identities").glob("*.json"))
@@ -130,6 +142,8 @@ class CrmAcpFactoryTest(unittest.TestCase):
             config = json.loads((agent_dir / "config.json").read_text())
 
             self.assertEqual(config["claude_session_id"], record["session_id"])
+            self.assertEqual(config["model"], "claude-fable-5[1m]")
+            self.assertEqual(config["startup_delay"], 5)
             self.assertFalse(config["telegram_enabled"])
             self.assertEqual(config["crons"], [])
             self.assertNotIn(PRIVATE_KEY_A, identities[0].read_text())
@@ -264,6 +278,30 @@ class CrmAcpFactoryTest(unittest.TestCase):
                 rotated,
             )
 
+    def test_selected_model_survives_factory_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            factory = self.make_factory(root)
+            environment = {
+                "BUZZ_PRIVATE_KEY": PRIVATE_KEY_A,
+                "BUZZ_ACP_SESSION_TITLE": "Writer",
+            }
+            created = factory.resolve(environment)
+            config_path = (
+                root
+                / "crm/factory/agents"
+                / created.agent_name
+                / "config.json"
+            )
+            agent_config = json.loads(config_path.read_text())
+            agent_config["model"] = "sonnet"
+            config_path.write_text(json.dumps(agent_config))
+
+            restarted = factory.resolve(environment)
+
+            self.assertEqual(restarted.model_id, "sonnet")
+            self.assertEqual(json.loads(config_path.read_text())["model"], "sonnet")
+
     def test_custom_workspace_must_be_absolute_existing_and_approved(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -302,9 +340,12 @@ class CrmAcpFactoryTest(unittest.TestCase):
 
 class FactoryCliAndArtifactTest(unittest.TestCase):
     def test_factory_cli_resolves_preview(self):
-        runtime = parse_runtime(["--factory"], environment={})
+        runtime = parse_runtime(
+            ["--factory"],
+            environment={"CRM_CLAUDE_MODEL_DISCOVERY": "disabled"},
+        )
 
-        self.assertEqual(runtime.model_id, "crm-claude-current")
+        self.assertEqual(runtime.model_id, "default")
         self.assertFalse(runtime.prompt_enabled)
 
     def test_factory_cli_rejects_unsafe_instance_before_writing(self):
@@ -340,6 +381,7 @@ class FactoryCliAndArtifactTest(unittest.TestCase):
         environment.pop("BUZZ_AUTH_TAG", None)
         environment.pop("BUZZ_MANAGED_AGENT", None)
         environment["CRM_BUZZ_RELAY_PUBKEY"] = "8" * 64
+        environment["CRM_CLAUDE_MODEL_DISCOVERY"] = "disabled"
 
         completed = subprocess.run(
             [sys.executable, "integrations/crm_acp.py", "--factory"],
@@ -356,7 +398,7 @@ class FactoryCliAndArtifactTest(unittest.TestCase):
 
         self.assertEqual(responses[1]["result"]["info"]["name"], "crm-acp-crm-factory-preview")
         model = responses[2]["result"]["configOptions"][0]
-        self.assertEqual(model["currentValue"], "crm-claude-current")
+        self.assertEqual(model["currentValue"], "default")
 
     def test_generic_harness_has_no_fixed_agent(self):
         harness = json.loads(Path("integrations/harnesses/crm-acp.json").read_text())
@@ -391,6 +433,8 @@ class FactoryCliAndArtifactTest(unittest.TestCase):
         self.assertIn("<key>CRM_AGENT_DIR</key>", launchd)
         self.assertIn('AGENT_DIR="${CRM_AGENT_DIR:-', restart)
         self.assertIn("ARGS=(--resume", restart)
+        self.assertIn('--quiet)', restart)
+        self.assertIn('RESTART_NOTIFY=""', restart)
         self.assertIn('AGENT_DIR="${CRM_AGENT_DIR:-', hard_restart)
         self.assertIn("claude_session_id", hard_restart)
         self.assertIn("bash '${BUS_DIR}/hard-restart.sh'", fast_checker)

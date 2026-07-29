@@ -96,7 +96,9 @@ existing agents. Do not use them for new roles.
 2. Set the agent name and instructions.
 3. Choose **Customize for this agent**.
 4. Select **CRM ACP (Auto-Provision)**.
-5. Leave its fixed CRM model selected.
+5. Choose any model reported by the installed Claude Code runtime. The list
+   mirrors Buzz's Claude Code harness, including account-specific models and
+   `Custom model`.
 6. Optional: under Advanced, set `CRM_WORKSPACE` to an existing absolute
    directory under `~/Documents` or `~/repos`.
 7. Under Advanced, set the Buzz response policy to **Allowlist** and add the
@@ -117,14 +119,21 @@ It also registers a dedicated launchd service, tmux session, CRM inbox, ACP
 return inbox, Claude session UUID, and local history boundary. The Buzz agent
 name is presentation only. Renaming the agent reuses the same local identity.
 
+The selected Claude model is stored in that agent's private `config.json`.
+Initial launch and every resume pass it to Claude Code with `--model`. A later
+model change schedules a quiet session resume so the new model takes effect
+without generating a Telegram notification. If Claude Code's live catalog is
+temporarily unavailable, creation falls back to its `default` alias.
+
 Buzz creates and holds each managed private identity. CRM hashes that identity
 in memory and persists only its SHA-256 fingerprint. Private keys, auth tags,
 Telegram tokens, and other credentials never belong in a harness or factory
 record.
 
 Factory directories are mode `0700`; records and generated agent files are
-`0600`. A Buzz model-discovery launch without a managed identity returns the
-fixed model but cannot process prompts. A managed launch missing its private
+`0600`. A Buzz model-discovery launch without a managed identity delegates to
+the installed Claude Code ACP adapter and cannot process prompts. The probe
+receives no Buzz private identity or owner attestation. A managed launch missing its private
 identity fails closed.
 
 The generated agent receives its persona, role, and encrypted core from Buzz on
