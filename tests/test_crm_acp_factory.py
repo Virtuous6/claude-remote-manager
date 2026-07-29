@@ -164,6 +164,75 @@ class CrmAcpFactoryTest(unittest.TestCase):
             self.assertEqual(called[1], agent_dir)
             self.assertNotIn(PRIVATE_KEY_A, repr(service.call_args))
 
+    def test_first_spawn_uses_model_selected_in_buzz(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = Mock()
+            factory = self.make_factory(root, service)
+
+            created = factory.resolve(
+                {
+                    "BUZZ_PRIVATE_KEY": PRIVATE_KEY_A,
+                    "BUZZ_ACP_SESSION_TITLE": "Maxine V2",
+                    "BUZZ_ACP_MODEL": "opus[1m]",
+                }
+            )
+
+            config = json.loads(
+                (
+                    root
+                    / "crm/factory/agents"
+                    / created.agent_name
+                    / "config.json"
+                ).read_text()
+            )
+            self.assertEqual(created.model_id, "opus[1m]")
+            self.assertEqual(config["model"], "opus[1m]")
+            service.assert_called_once()
+
+    def test_buzz_model_edit_persists_and_reloads_existing_agent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = Mock()
+            factory = self.make_factory(root, service)
+            environment = {
+                "BUZZ_PRIVATE_KEY": PRIVATE_KEY_A,
+                "BUZZ_ACP_SESSION_TITLE": "Writer",
+            }
+            created = factory.resolve(environment)
+            agent_dir = root / "crm/factory/agents" / created.agent_name
+            before = json.loads((agent_dir / "config.json").read_text())
+
+            updated = factory.resolve(
+                {
+                    **environment,
+                    "BUZZ_ACP_MODEL": "sonnet",
+                }
+            )
+
+            after = json.loads((agent_dir / "config.json").read_text())
+            self.assertEqual(updated.model_id, "sonnet")
+            self.assertEqual(after["model"], "sonnet")
+            self.assertEqual(after["claude_session_id"], before["claude_session_id"])
+            self.assertEqual(service.call_count, 2)
+
+    def test_unsafe_buzz_model_is_rejected_before_service_change(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = Mock()
+            factory = self.make_factory(root, service)
+
+            with self.assertRaisesRegex(ValueError, "model"):
+                factory.resolve(
+                    {
+                        "BUZZ_PRIVATE_KEY": PRIVATE_KEY_A,
+                        "BUZZ_ACP_SESSION_TITLE": "Writer",
+                        "BUZZ_ACP_MODEL": "sonnet; touch /tmp/x",
+                    }
+                )
+
+            service.assert_not_called()
+
     def test_rename_reuses_existing_slug_and_updates_title(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -337,6 +406,121 @@ class CrmAcpFactoryTest(unittest.TestCase):
                             }
                         )
 
+    def test_existing_agent_can_switch_workspace_and_starts_fresh_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = Mock()
+            factory = self.make_factory(root, service)
+            environment = {
+                "BUZZ_PRIVATE_KEY": PRIVATE_KEY_A,
+                "BUZZ_ACP_SESSION_TITLE": "Maxine V2",
+            }
+            created = factory.resolve(environment)
+            agent_dir = root / "crm/factory/agents" / created.agent_name
+            first = json.loads((agent_dir / "config.json").read_text())
+            writing_corner = root / "home/Documents/1000months"
+            writing_corner.mkdir()
+
+            updated = factory.resolve(
+                {
+                    **environment,
+                    "CRM_WORKSPACE": str(writing_corner),
+                }
+            )
+
+            config = json.loads((agent_dir / "config.json").read_text())
+            record = json.loads(
+                next((root / "crm/factory/identities").glob("*.json")).read_text()
+            )
+            self.assertEqual(updated.agent_name, created.agent_name)
+            self.assertEqual(
+                config["working_directory"],
+                str(writing_corner.resolve()),
+            )
+            self.assertNotEqual(config["claude_session_id"], first["claude_session_id"])
+            self.assertEqual(record["session_id"], config["claude_session_id"])
+            self.assertEqual(record["workspace"], config["working_directory"])
+            self.assertEqual(service.call_count, 2)
+
+    def test_repeated_workspace_value_does_not_restart_or_rotate_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = Mock()
+            factory = self.make_factory(root, service)
+            writing_corner = root / "home/Documents/1000months"
+            writing_corner.mkdir()
+            environment = {
+                "BUZZ_PRIVATE_KEY": PRIVATE_KEY_A,
+                "BUZZ_ACP_SESSION_TITLE": "Maxine V2",
+                "CRM_WORKSPACE": str(writing_corner),
+            }
+
+            created = factory.resolve(environment)
+            agent_dir = root / "crm/factory/agents" / created.agent_name
+            first = json.loads((agent_dir / "config.json").read_text())
+            factory.resolve(environment)
+            second = json.loads((agent_dir / "config.json").read_text())
+
+            self.assertEqual(second["claude_session_id"], first["claude_session_id"])
+            service.assert_called_once()
+
+    def test_invalid_workspace_edit_preserves_existing_agent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = Mock()
+            factory = self.make_factory(root, service)
+            environment = {
+                "BUZZ_PRIVATE_KEY": PRIVATE_KEY_A,
+                "BUZZ_ACP_SESSION_TITLE": "Writer",
+            }
+            created = factory.resolve(environment)
+            agent_dir = root / "crm/factory/agents" / created.agent_name
+            config_path = agent_dir / "config.json"
+            record_path = next((root / "crm/factory/identities").glob("*.json"))
+            original_config = config_path.read_text()
+            original_record = record_path.read_text()
+
+            with self.assertRaisesRegex(ValueError, "workspace"):
+                factory.resolve(
+                    {
+                        **environment,
+                        "CRM_WORKSPACE": str(root / "outside"),
+                    }
+                )
+
+            self.assertEqual(config_path.read_text(), original_config)
+            self.assertEqual(record_path.read_text(), original_record)
+            service.assert_called_once()
+
+    def test_workspace_reload_failure_rolls_back_record_and_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            service = Mock(side_effect=[None, RuntimeError("reload failed")])
+            factory = self.make_factory(root, service)
+            environment = {
+                "BUZZ_PRIVATE_KEY": PRIVATE_KEY_A,
+                "BUZZ_ACP_SESSION_TITLE": "Writer",
+            }
+            created = factory.resolve(environment)
+            agent_dir = root / "crm/factory/agents" / created.agent_name
+            config_path = agent_dir / "config.json"
+            record_path = next((root / "crm/factory/identities").glob("*.json"))
+            original_config = config_path.read_text()
+            original_record = record_path.read_text()
+            writing_corner = root / "home/Documents/1000months"
+            writing_corner.mkdir()
+
+            with self.assertRaisesRegex(RuntimeError, "reload"):
+                factory.resolve(
+                    {
+                        **environment,
+                        "CRM_WORKSPACE": str(writing_corner),
+                    }
+                )
+
+            self.assertEqual(config_path.read_text(), original_config)
+            self.assertEqual(record_path.read_text(), original_record)
+
 
 class FactoryCliAndArtifactTest(unittest.TestCase):
     def test_factory_cli_resolves_preview(self):
@@ -405,6 +589,8 @@ class FactoryCliAndArtifactTest(unittest.TestCase):
 
         self.assertEqual(harness["id"], "crm-acp")
         self.assertEqual(harness["label"], "CRM ACP (Auto-Provision)")
+        self.assertIn("CRM_WORKSPACE", harness["installHint"])
+        self.assertTrue(harness["docsUrl"].endswith("/docs/CRM_ACP.md"))
         self.assertNotIn("name", harness)
         self.assertEqual(harness["args"][-1], "--factory")
         self.assertNotIn("--agent", harness["args"])
