@@ -585,6 +585,9 @@ class CrmAcpFactory:
 
         identity = FactoryIdentity.from_environment(environment)
         catalog = self.model_catalog(environment)
+        configured_model = environment.get("BUZZ_ACP_MODEL", "").strip()
+        if configured_model:
+            _validate_claude_model(configured_model)
         self._private_directory(self.factory_root)
         lock_path = self.factory_root / "factory.lock"
         lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -592,7 +595,12 @@ class CrmAcpFactory:
             os.chmod(lock_path, 0o600)
             with os.fdopen(lock_fd, "r+") as lock:
                 fcntl.flock(lock, fcntl.LOCK_EX)
-                return self._resolve_locked(identity, environment, catalog)
+                return self._resolve_locked(
+                    identity,
+                    environment,
+                    catalog,
+                    configured_model,
+                )
         except Exception:
             try:
                 os.close(lock_fd)
@@ -605,6 +613,7 @@ class CrmAcpFactory:
         identity: FactoryIdentity,
         environment: dict[str, str],
         catalog: ClaudeModelCatalog,
+        configured_model: str,
     ) -> AgentConfig:
         identities_dir = self.factory_root / "identities"
         agents_dir = self.factory_root / "agents"
@@ -614,6 +623,10 @@ class CrmAcpFactory:
 
         record_path = identities_dir / f"{identity.fingerprint}.json"
         created = not record_path.exists()
+        workspace_changed = False
+        model_changed = False
+        original_record: dict[str, Any] | None = None
+        original_agent_config: dict[str, Any] | None = None
         if created:
             slug = identity.proposed_slug
             workspace = self._workspace(
@@ -632,17 +645,21 @@ class CrmAcpFactory:
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "service_registered": False,
             }
-            selected_model = catalog.current
+            selected_model = configured_model or catalog.current
         else:
             record = json.loads(record_path.read_text())
             if record.get("fingerprint") != identity.fingerprint:
                 raise ValueError("CRM factory identity record mismatch")
+            original_record = dict(record)
             record["title"] = identity.title
             agent_dir = Path(str(record["agent_dir"])).resolve()
             workspace = Path(str(record["workspace"])).resolve()
             agent_config_path = agent_dir / "config.json"
             if agent_config_path.exists():
                 agent_config = json.loads(agent_config_path.read_text())
+                if not isinstance(agent_config, dict):
+                    raise ValueError("invalid CRM factory agent config")
+                original_agent_config = dict(agent_config)
                 current_session = str(agent_config.get("claude_session_id") or "")
                 if not UUID_PATTERN.fullmatch(current_session):
                     raise ValueError("invalid CRM factory Claude session")
@@ -652,6 +669,9 @@ class CrmAcpFactory:
                 )
             else:
                 selected_model = catalog.current
+            if configured_model and configured_model != selected_model:
+                selected_model = configured_model
+                model_changed = True
 
         slug = str(record["slug"])
         if not AGENT_PATTERN.fullmatch(slug):
@@ -659,6 +679,17 @@ class CrmAcpFactory:
         expected_agent_dir = (agents_dir / slug).resolve()
         if agent_dir != expected_agent_dir:
             raise ValueError("invalid CRM factory agent directory")
+        configured_workspace = environment.get("CRM_WORKSPACE", "").strip()
+        if not created and configured_workspace:
+            requested_workspace = self._workspace(
+                configured_workspace,
+                workspaces_dir / slug,
+            )
+            if requested_workspace != workspace:
+                workspace = requested_workspace
+                record["workspace"] = str(workspace)
+                record["session_id"] = str(uuid.uuid4())
+                workspace_changed = True
         if not workspace.is_dir():
             raise ValueError("CRM workspace no longer exists")
 
@@ -679,6 +710,14 @@ class CrmAcpFactory:
             self.service_runner(slug, agent_dir)
             record["service_registered"] = True
             self._atomic_json(record_path, record)
+        elif workspace_changed or model_changed:
+            try:
+                self.service_runner(slug, agent_dir)
+            except Exception:
+                if original_record is not None and original_agent_config is not None:
+                    self._atomic_json(record_path, original_record)
+                    self._atomic_json(agent_dir / "config.json", original_agent_config)
+                raise
         return config
 
     def _workspace(self, configured: str, default: Path) -> Path:

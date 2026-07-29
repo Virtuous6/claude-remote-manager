@@ -99,7 +99,8 @@ existing agents. Do not use them for new roles.
 5. Choose any model reported by the installed Claude Code runtime. The list
    mirrors Buzz's Claude Code harness, including account-specific models and
    `Custom model`.
-6. Optional: under Advanced, set `CRM_WORKSPACE` to an existing absolute
+6. Optional: open **Advanced** → **Environment variables** → **Add variable**.
+   Set the key to `CRM_WORKSPACE` and its value to an existing absolute
    directory under `~/Documents` or `~/repos`.
 7. Under Advanced, set the Buzz response policy to **Allowlist** and add the
    pinned `Buzz Relay Service` pubkey from the harness. The owner and
@@ -124,6 +125,13 @@ Initial launch and every resume pass it to Claude Code with `--model`. A later
 model change schedules a quiet session resume so the new model takes effect
 without generating a Telegram notification. If Claude Code's live catalog is
 temporarily unavailable, creation falls back to its `default` alias.
+
+`CRM_WORKSPACE` may also be added or changed later in **Edit Agent**. The next
+turn moves that same Buzz-managed agent to the new directory and starts a fresh
+local Claude session there. Buzz identity and encrypted memory remain intact;
+only the directory-bound Claude conversation history resets. Removing the
+variable does not move an already-provisioned agent back to its fallback
+workspace.
 
 Buzz creates and holds each managed private identity. CRM hashes that identity
 in memory and persists only its SHA-256 fingerprint. Private keys, auth tags,
