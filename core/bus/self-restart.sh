@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # self-restart.sh - Restart Claude CLI with --continue (preserves conversation)
-# Usage: bash ../../bus/self-restart.sh --reason "why"
+# Usage: bash ../../bus/self-restart.sh --reason "why" [--quiet]
 #
 # Kills the current Claude process inside tmux and relaunches with --continue.
 # This reloads all configs (settings.json, hooks, CLAUDE.md) while preserving
@@ -25,7 +25,25 @@ CRM_INSTANCE_ID="${CRM_INSTANCE_ID:-default}"
 CRM_ROOT="${CRM_ROOT:-${HOME}/.claude-remote/${CRM_INSTANCE_ID}}"
 
 TMUX_SESSION="crm-${CRM_INSTANCE_ID}-${AGENT}"
-REASON="${2:-no reason specified}"
+REASON="no reason specified"
+QUIET=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --reason)
+            [[ $# -ge 2 ]] || { echo "ERROR: --reason requires a value" >&2; exit 1; }
+            REASON="$2"
+            shift 2
+            ;;
+        --quiet)
+            QUIET=true
+            shift
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # Log the restart
 LOG_DIR="${CRM_ROOT}/logs/${AGENT}"
@@ -89,7 +107,11 @@ json.dump(deep_merge(base, override), open(sys.argv[3], 'w'), indent=2)
     EXTRA_FLAGS+=(--add-dir "${TEMPLATE_ROOT}")
 fi
 
-RESTART_NOTIFY="After setting up crons, send a Telegram message to the user saying you restarted, why, and what you are resuming."
+if [[ "${QUIET}" == "true" ]]; then
+    RESTART_NOTIFY=""
+else
+    RESTART_NOTIFY="After setting up crons, send a Telegram message to the user saying you restarted, why, and what you are resuming."
+fi
 CRON_SETUP_INSTRUCTION="Create one separate cron/loop for each enabled entry in the crons array. Do not combine entries into one dispatcher."
 
 CONTINUE_PROMPT="SESSION CONTINUATION: Your CLI was restarted with --continue to reload configs. Reason: ${REASON}. Your conversation history is preserved. Re-read bootstrap files listed in CLAUDE.md, set up crons from config.json via /loop. ${CRON_SETUP_INSTRUCTION} Then resume what you were working on. ${RESTART_NOTIFY}"
