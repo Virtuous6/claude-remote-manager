@@ -1784,9 +1784,13 @@ async def run_agent(config: AgentConfig) -> None:
     timeout = float(os.environ.get("CRM_ACP_REPLY_TIMEOUT", "600"))
     crm_root = default_crm_root()
     bus = CrmBus(crm_root, config=config)
-    workflows = BuzzWorkflowManager(config, crm_root)
-    workflows.reconcile_title()
-    authorizer = BuzzTurnAuthorizer.from_environment()
+    if config.prompt_enabled:
+        workflows: BuzzWorkflowManager | None = BuzzWorkflowManager(config, crm_root)
+        workflows.reconcile_title()
+        authorizer = BuzzTurnAuthorizer.from_environment()
+    else:
+        workflows = None
+        authorizer = BuzzTurnAuthorizer()
     agent = CrmAcpAgent(
         config,
         bus,
