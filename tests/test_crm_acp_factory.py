@@ -337,7 +337,9 @@ class FactoryCliAndArtifactTest(unittest.TestCase):
         )
         environment = dict(os.environ)
         environment.pop("BUZZ_PRIVATE_KEY", None)
+        environment.pop("BUZZ_AUTH_TAG", None)
         environment.pop("BUZZ_MANAGED_AGENT", None)
+        environment["CRM_BUZZ_RELAY_PUBKEY"] = "8" * 64
 
         completed = subprocess.run(
             [sys.executable, "integrations/crm_acp.py", "--factory"],
